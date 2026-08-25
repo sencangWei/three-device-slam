@@ -8,6 +8,7 @@ from typing import BinaryIO
 from zlib import crc32
 
 from .model import SensorRecord
+from .session_lifecycle import assert_producer_writes_allowed
 
 
 _SAFE_STREAM_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
@@ -22,6 +23,7 @@ class AppendOnlySessionWriter:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        assert_producer_writes_allowed(self.root)
         self._claim_path = self.root / ".writer.lock"
         self._claim_owned = False
         try:
@@ -34,6 +36,7 @@ class AppendOnlySessionWriter:
         try:
             os.close(descriptor)
             descriptor = None
+            assert_producer_writes_allowed(self.root)
             if (self.root / "manifest.json").exists():
                 raise RuntimeError("session is sealed")
             self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}

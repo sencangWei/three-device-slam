@@ -28,6 +28,7 @@ from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -76,6 +77,7 @@ from .imu.calibration import IMUCalibration
 from .camera.realsense_capture import CameraFrame
 from .recorder.recorder import IMU_PACK_SIZE, UnitRecorder
 from three_device_slam.core import BarrierDirectory, DeviceHeartbeat
+from three_device_slam.core.session_lifecycle import producer_claim
 from .gripper.training_sync import (
     MAX_CAMERA_GRIPPER_DELTA_MS,
     MAX_ENCODER_PAIR_GAP_US,
@@ -1322,8 +1324,18 @@ def preview_mosaic(frame_map: dict) -> np.ndarray:
 
 
 def _main() -> int:
-    global STREAMS, STREAM_KEYS, CAMERA_RAW_BYTES_PER_SECOND
     args = parse_args()
+    claim = (
+        producer_claim(args.session, args.device_id)
+        if args.session is not None
+        else nullcontext()
+    )
+    with claim:
+        return _run_claimed(args)
+
+
+def _run_claimed(args) -> int:
+    global STREAMS, STREAM_KEYS, CAMERA_RAW_BYTES_PER_SECOND
     _load_hardware_modules()
     STREAMS = capture_streams_for_mode(args.capture_mode)
     STREAM_KEYS = tuple(name for name, *_ in STREAMS)

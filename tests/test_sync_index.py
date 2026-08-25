@@ -518,14 +518,10 @@ def test_invalid_or_absent_task_anchor_is_terminal_and_leaves_no_manifest(
     tmp_path, coordinator
 ):
     session = _write_session(tmp_path / "session", coordinator=coordinator)
-    manifest_path = session / "sync" / "manifest.json"
-    manifest_path.parent.mkdir(parents=True)
-    manifest_path.write_text("stale success", encoding="utf-8")
-
     with pytest.raises(ValueError):
         _builder().build_index(session)
 
-    assert not manifest_path.exists()
+    assert not (session / "sync").exists()
 
 
 @pytest.mark.parametrize(
@@ -641,34 +637,31 @@ def test_producer_sixteen_column_d405_csv_is_accepted(tmp_path):
 def test_missing_source_is_terminal_and_leaves_no_success_manifest(tmp_path):
     session = _write_session(tmp_path / "session")
     (session / "right" / "d405_frames.csv").unlink()
-    manifest_path = session / "sync" / "manifest.json"
-    manifest_path.parent.mkdir(parents=True)
-    manifest_path.write_text("stale success", encoding="utf-8")
-
     with pytest.raises(OSError):
         _builder().build_index(session)
 
-    assert not manifest_path.exists()
+    assert not (session / "sync").exists()
 
 
 def test_source_change_before_commit_is_terminal(tmp_path, monkeypatch):
     session = _write_session(tmp_path / "session")
     builder = _builder()
-    original = builder._sha256_file
+    original = builder._capture_sources
     calls = 0
 
-    def change_source(path):
+    def change_source(root):
         nonlocal calls
         calls += 1
+        captured = original(root)
         if calls == 1:
             (session / "left" / "d405_frames.csv").write_text(
                 "set_index,arrival_mono,warmup\n9,10.0,0\n", encoding="utf-8"
             )
-        return original(path)
+        return captured
 
-    monkeypatch.setattr(builder, "_sha256_file", change_source)
+    monkeypatch.setattr(builder, "_capture_sources", change_source)
 
-    with pytest.raises(RuntimeError, match="changed"):
+    with pytest.raises(RuntimeError, match="seal|changed"):
         builder.build_index(session)
 
     assert not (session / "sync" / "manifest.json").exists()
@@ -679,87 +672,84 @@ def test_source_change_while_temporary_outputs_are_written_is_terminal(
 ):
     session = _write_session(tmp_path / "session")
     builder = _builder()
-    original = builder._write_temporary
+    original = builder._write_directory_member
     calls = 0
 
-    def change_source_after_temp(path, payload):
+    def change_source_after_temp(directory, name, payload):
         nonlocal calls
-        temporary = original(path, payload)
+        result = original(directory, name, payload)
         calls += 1
         if calls == 1:
             source = session / "left" / "d405_frames.csv"
             source.write_bytes(source.read_bytes() + b"\n")
-        return temporary
+        return result
 
-    monkeypatch.setattr(builder, "_write_temporary", change_source_after_temp)
+    monkeypatch.setattr(builder, "_write_directory_member", change_source_after_temp)
 
-    with pytest.raises(RuntimeError, match="changed"):
+    with pytest.raises(RuntimeError, match="seal|changed"):
         builder.build_index(session)
 
-    assert not (session / "sync" / "manifest.json").exists()
+    assert not (session / "sync").exists()
 
 
 def test_source_change_during_csv_commit_never_gets_a_manifest(tmp_path, monkeypatch):
     session = _write_session(tmp_path / "session")
     builder = _builder()
-    csv_path = session / "sync" / "common_30hz.csv"
     real_replace = builder.os.replace
 
     def change_source_after_csv_replace(source, target):
         result = real_replace(source, target)
-        if Path(target) == csv_path:
+        if Path(target) == session / "sync":
             changed = session / "left" / "d405_frames.csv"
             changed.write_bytes(changed.read_bytes() + b"\n")
         return result
 
     monkeypatch.setattr(builder.os, "replace", change_source_after_csv_replace)
 
-    with pytest.raises(RuntimeError, match="changed"):
+    with pytest.raises(RuntimeError, match="seal|changed"):
         builder.build_index(session)
 
-    assert not (session / "sync" / "manifest.json").exists()
+    assert not (session / "sync").exists()
 
 
 def test_source_change_during_manifest_replace_removes_manifest(tmp_path, monkeypatch):
     session = _write_session(tmp_path / "session")
     builder = _builder()
-    manifest_path = session / "sync" / "manifest.json"
     real_replace = builder.os.replace
 
     def change_source_after_manifest_replace(source, target):
         result = real_replace(source, target)
-        if Path(target) == manifest_path:
+        if Path(target) == session / "sync":
             changed = session / "left" / "d405_frames.csv"
             changed.write_bytes(changed.read_bytes() + b"\n")
         return result
 
     monkeypatch.setattr(builder.os, "replace", change_source_after_manifest_replace)
 
-    with pytest.raises(RuntimeError, match="changed"):
+    with pytest.raises(RuntimeError, match="seal|changed"):
         builder.build_index(session)
 
-    assert not manifest_path.exists()
+    assert not (session / "sync").exists()
 
 
 def test_committed_csv_change_after_replace_removes_manifest(tmp_path, monkeypatch):
     session = _write_session(tmp_path / "session")
     builder = _builder()
     csv_path = session / "sync" / "common_30hz.csv"
-    manifest_path = session / "sync" / "manifest.json"
     real_replace = builder.os.replace
 
     def corrupt_csv_after_replace(source, target):
         result = real_replace(source, target)
-        if Path(target) == csv_path:
+        if Path(target) == session / "sync":
             csv_path.write_bytes(csv_path.read_bytes() + b"corrupt")
         return result
 
     monkeypatch.setattr(builder.os, "replace", corrupt_csv_after_replace)
 
-    with pytest.raises(RuntimeError, match="CSV changed"):
+    with pytest.raises(RuntimeError, match="sync|CSV"):
         builder.build_index(session)
 
-    assert not manifest_path.exists()
+    assert not (session / "sync").exists()
 
 
 def test_final_verification_detects_earlier_source_mutated_while_hashing_later_source(
@@ -809,11 +799,10 @@ def test_publication_lock_is_exclusive(tmp_path):
 def test_manifest_replace_failure_never_leaves_success_manifest(tmp_path, monkeypatch):
     session = _write_session(tmp_path / "session")
     builder = _builder()
-    manifest_path = session / "sync" / "manifest.json"
     real_replace = builder.os.replace
 
     def fail_manifest(source, target):
-        if Path(target) == manifest_path:
+        if Path(target) == session / "sync":
             raise OSError("manifest replace failed")
         return real_replace(source, target)
 
@@ -822,7 +811,7 @@ def test_manifest_replace_failure_never_leaves_success_manifest(tmp_path, monkey
     with pytest.raises(OSError, match="manifest replace"):
         builder.build_index(session)
 
-    assert not manifest_path.exists()
+    assert not (session / "sync").exists()
 
 
 def test_git_provenance_commands_are_rooted_at_repository(monkeypatch):
@@ -914,4 +903,141 @@ def test_main_returns_nonzero_without_manifest_for_invalid_input(tmp_path):
     (session / "coordinator.json").write_text("{}", encoding="utf-8")
 
     assert _builder().main(["--session", str(session)]) != 0
-    assert not (session / "sync" / "manifest.json").exists()
+    assert not (session / "sync").exists()
+
+
+def test_sync_symlink_to_raw_is_rejected_before_any_raw_write(tmp_path):
+    session = _write_session(tmp_path / "session")
+    raw_before = {
+        path.relative_to(session): path.read_bytes()
+        for path in session.rglob("*")
+        if path.is_file()
+    }
+    (session / "sync").symlink_to(session / "ego", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe.*sync"):
+        _builder().build_index(session)
+
+    assert raw_before == {
+        path.relative_to(session): path.read_bytes()
+        for path in session.rglob("*")
+        if path.is_file() and path.name != "session.seal.json"
+    }
+    assert not (session / "ego" / "common_30hz.csv").exists()
+
+
+def test_second_sync_member_failure_leaves_no_final_or_temporary_directory(
+    tmp_path, monkeypatch
+):
+    session = _write_session(tmp_path / "session")
+    builder = _builder()
+    original = getattr(builder, "_write_directory_member", lambda *_args: None)
+
+    def fail_manifest(directory, name, payload):
+        if name == "manifest.json":
+            raise OSError("manifest member write failed")
+        return original(directory, name, payload)
+
+    monkeypatch.setattr(builder, "_write_directory_member", fail_manifest, raising=False)
+
+    with pytest.raises(OSError, match="manifest member write failed"):
+        builder.build_index(session)
+
+    assert not (session / "sync").exists()
+    assert not list(session.glob(".sync.*.tmp"))
+
+
+def test_sync_directory_appears_only_after_both_members_are_durable(tmp_path, monkeypatch):
+    session = _write_session(tmp_path / "session")
+    builder = _builder()
+    real_replace = builder.os.replace
+    observed = []
+
+    def observe_directory_publish(source, target):
+        if Path(target) == session / "sync":
+            assert not Path(target).exists()
+            assert {path.name for path in Path(source).iterdir()} == {
+                "common_30hz.csv",
+                "manifest.json",
+            }
+            observed.append(True)
+        return real_replace(source, target)
+
+    monkeypatch.setattr(builder.os, "replace", observe_directory_publish)
+
+    builder.build_index(session)
+
+    assert observed == [True]
+    assert (session / "sync" / "common_30hz.csv").is_file()
+    assert (session / "sync" / "manifest.json").is_file()
+
+
+def test_existing_sync_is_strictly_idempotent_and_never_replaced(tmp_path, monkeypatch):
+    session = _write_session(tmp_path / "session")
+    builder = _builder()
+    expected = builder.build_index(session)
+
+    def forbid_replace(_source, target):
+        if Path(target) == session / "sync":
+            raise AssertionError("immutable sync directory was replaced")
+        raise AssertionError(f"unexpected replace: {target}")
+
+    monkeypatch.setattr(builder.os, "replace", forbid_replace)
+
+    assert builder.build_index(session) == expected
+
+
+def test_existing_incomplete_sync_is_rejected_without_overwrite(tmp_path):
+    session = _write_session(tmp_path / "session")
+    sync = session / "sync"
+    sync.mkdir()
+    stale = sync / "common_30hz.csv"
+    stale.write_text("partial", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="existing sync"):
+        _builder().build_index(session)
+
+    assert stale.read_text(encoding="utf-8") == "partial"
+    assert not (sync / "manifest.json").exists()
+
+
+def test_active_writer_claim_and_second_offline_operation_are_rejected(tmp_path):
+    session = _write_session(tmp_path / "session")
+    writer_claim = session / "ego" / ".writer.lock"
+    writer_claim.write_bytes(b"")
+
+    with pytest.raises(RuntimeError, match="active writer"):
+        _builder().build_index(session)
+
+    writer_claim.unlink()
+    builder = _builder()
+    with builder._offline_session_lease(session):
+        with pytest.raises(RuntimeError, match="offline publication.*progress"):
+            builder.build_index(session)
+
+
+def test_cooperative_source_change_after_seal_never_publishes_sync(tmp_path, monkeypatch):
+    session = _write_session(tmp_path / "session")
+    builder = _builder()
+    original = getattr(builder, "_write_directory_member", lambda *_args: None)
+    mutated = False
+
+    def mutate_after_first_member(directory, name, payload):
+        nonlocal mutated
+        result = original(directory, name, payload)
+        if name == "common_30hz.csv" and not mutated:
+            mutated = True
+            source = session / "left" / "d405_frames.csv"
+            source.write_bytes(source.read_bytes() + b"\n")
+        return result
+
+    monkeypatch.setattr(
+        builder, "_write_directory_member", mutate_after_first_member, raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="seal|changed"):
+        builder.build_index(session)
+
+    assert mutated
+    assert not (session / "sync").exists()
+    assert not list(session.glob(".sync.*.tmp"))

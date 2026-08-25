@@ -1565,3 +1565,37 @@ def test_cli_rejects_invalid_duration_or_non_distinct_d405_inputs(extra_args):
 
     with pytest.raises(SystemExit):
         coordinator.parse_args(argv)
+
+
+def test_coordinator_claim_spans_worker_launch_and_report_publication(tmp_path, monkeypatch):
+    original_write = coordinator._write_atomic_json
+    observed_report_claim = []
+
+    def observe_report(path, payload):
+        if path.name == "coordinator.json":
+            assert (path.parent / ".producer.coordinator.lock").is_file()
+            observed_report_claim.append(True)
+        return original_write(path, payload)
+
+    monkeypatch.setattr(coordinator, "_write_atomic_json", observe_report)
+
+    session, _, _, launches, _ = run_fake_session(tmp_path, monkeypatch)
+
+    assert launches
+    assert observed_report_claim
+    assert not (session / ".producer.coordinator.lock").exists()
+
+
+def test_coordinator_rejects_sealed_session_before_creating_runtime_files(tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "session.seal.json").write_text("sealed", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        coordinator.run_coordinator(
+            session,
+            {device: [device] for device in DEVICES},
+            1.0,
+        )
+
+    assert {path.name for path in session.iterdir()} == {"session.seal.json"}

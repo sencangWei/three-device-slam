@@ -23,6 +23,7 @@ from .capture import (
 from three_device_slam.core import BarrierDirectory
 from three_device_slam.core import DeviceHeartbeat, SensorRecord
 from three_device_slam.core import AppendOnlySessionWriter
+from three_device_slam.core.session_lifecycle import producer_claim
 
 
 MINIMUM_START_GUARD_NS = 100_000_000
@@ -752,6 +753,11 @@ def setup_storage(session: Path, *, writer_factory=AppendOnlySessionWriter):
 
 
 def run(args) -> int:
+    with producer_claim(args.session, "ego"):
+        return _run_claimed(args)
+
+
+def _run_claimed(args) -> int:
     try:
         ego_directory, writer = setup_storage(args.session)
     except StorageIoFailure as storage_failure:

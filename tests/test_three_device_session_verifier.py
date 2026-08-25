@@ -389,6 +389,18 @@ def _valid_session(tmp_path):
     return session
 
 
+def _rebuild_fixture(session):
+    """Re-seal a deliberately mutated test fixture before offline verification."""
+    for name in ("sync", "quality"):
+        directory = session / name
+        if directory.exists():
+            for path in directory.iterdir():
+                path.unlink()
+            directory.rmdir()
+    (session / "session.seal.json").unlink(missing_ok=True)
+    return _builder().build_index(session)
+
+
 def _refresh_ego_hash_evidence(session):
     manifest_path = session / "ego" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -449,7 +461,7 @@ def _set_d405_clock_evidence(
         writer.writerows(rows)
     _refresh_d405_raw_evidence(csv_path)
     try:
-        _builder().build_index(session)
+        _rebuild_fixture(session)
     except ValueError:
         pass
 
@@ -522,11 +534,10 @@ def _make_ego_clock_unavailable(
         coordinator["task_start_ego_frame_ns"] = None
     coordinator["worker_acceptance"]["ego"] = json.loads(acceptance_path.read_text())
     _write_json(coordinator_path, coordinator)
-    for path in (
-        session / "sync" / "manifest.json",
-        session / "sync" / "common_30hz.csv",
-    ):
-        path.unlink()
+    try:
+        _rebuild_fixture(session)
+    except ValueError:
+        pass
 
 
 def _run(session):
@@ -591,15 +602,12 @@ def test_quality_publication_failure_removes_both_final_reports(tmp_path, monkey
     session = _valid_session(tmp_path)
     verifier = _verifier()
     quality = session / "quality"
-    quality.mkdir()
     acquisition_path = quality / "acquisition_timing.json"
     product_path = quality / "product_status.json"
-    acquisition_path.write_text("stale pass", encoding="utf-8")
-    product_path.write_text("stale pass", encoding="utf-8")
     real_replace = verifier.os.replace
 
     def fail_product_replace(source, target):
-        if Path(target) == product_path:
+        if Path(target) == quality:
             raise OSError("product status replace failed")
         return real_replace(source, target)
 
@@ -610,7 +618,127 @@ def test_quality_publication_failure_removes_both_final_reports(tmp_path, monkey
 
     assert not acquisition_path.exists()
     assert not product_path.exists()
-    assert not list(quality.glob(".*.tmp"))
+    assert not quality.exists()
+    assert not list(session.glob(".quality.*.tmp"))
+
+
+def test_quality_symlink_to_raw_is_rejected_before_any_raw_write(tmp_path):
+    session = _valid_session(tmp_path)
+    raw_before = {
+        path.relative_to(session): path.read_bytes()
+        for directory in (session / "ego", session / "left", session / "right")
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    (session / "quality").symlink_to(session / "ego", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe.*quality"):
+        _verifier().verify_session(session)
+
+    assert raw_before == {
+        path.relative_to(session): path.read_bytes()
+        for directory in (session / "ego", session / "left", session / "right")
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    assert not (session / "ego" / "acquisition_timing.json").exists()
+
+
+def test_second_quality_member_failure_leaves_no_final_or_temporary_directory(
+    tmp_path, monkeypatch
+):
+    session = _valid_session(tmp_path)
+    verifier = _verifier()
+    original = getattr(verifier, "_write_quality_member", lambda *_args: None)
+
+    def fail_product(directory, name, payload):
+        if name == "product_status.json":
+            raise OSError("product member write failed")
+        return original(directory, name, payload)
+
+    monkeypatch.setattr(verifier, "_write_quality_member", fail_product, raising=False)
+
+    with pytest.raises(OSError, match="product member write failed"):
+        verifier.verify_session(session)
+
+    assert not (session / "quality").exists()
+    assert not list(session.glob(".quality.*.tmp"))
+
+
+def test_quality_directory_appears_only_after_both_members_are_durable(
+    tmp_path, monkeypatch
+):
+    session = _valid_session(tmp_path)
+    verifier = _verifier()
+    real_replace = verifier.os.replace
+    observed = []
+
+    def observe_directory_publish(source, target):
+        if Path(target) == session / "quality":
+            assert not Path(target).exists()
+            assert {path.name for path in Path(source).iterdir()} == {
+                "acquisition_timing.json",
+                "product_status.json",
+            }
+            observed.append(True)
+        return real_replace(source, target)
+
+    monkeypatch.setattr(verifier.os, "replace", observe_directory_publish)
+
+    verifier.verify_session(session)
+
+    assert observed == [True]
+    assert (session / "quality" / "acquisition_timing.json").is_file()
+    assert (session / "quality" / "product_status.json").is_file()
+
+
+def test_existing_quality_is_strictly_idempotent_and_never_replaced(
+    tmp_path, monkeypatch
+):
+    session = _valid_session(tmp_path)
+    verifier = _verifier()
+    expected = verifier.verify_session(session)
+
+    def forbid_replace(_source, target):
+        raise AssertionError(f"immutable quality directory was replaced: {target}")
+
+    monkeypatch.setattr(verifier.os, "replace", forbid_replace)
+
+    assert verifier.verify_session(session) == expected
+
+
+def test_existing_incomplete_quality_is_rejected_without_overwrite(tmp_path):
+    session = _valid_session(tmp_path)
+    quality = session / "quality"
+    quality.mkdir()
+    stale = quality / "acquisition_timing.json"
+    stale.write_text("partial", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="existing quality"):
+        _verifier().verify_session(session)
+
+    assert stale.read_text(encoding="utf-8") == "partial"
+    assert not (quality / "product_status.json").exists()
+
+
+def test_verifier_shares_offline_lease_with_builder(tmp_path):
+    session = _valid_session(tmp_path)
+    builder = _builder()
+
+    with builder._offline_session_lease(session):
+        with pytest.raises(RuntimeError, match="offline publication.*progress"):
+            _verifier().verify_session(session)
+
+
+def test_sealed_raw_tamper_cannot_publish_quality_pass(tmp_path):
+    session = _valid_session(tmp_path)
+    (session / "left" / "d405_frames.csv").write_bytes(
+        (session / "left" / "d405_frames.csv").read_bytes() + b"\n"
+    )
+
+    assert _verifier().main(["--session", str(session)]) == 2
+    product = session / "quality" / "product_status.json"
+    assert not product.exists() or json.loads(product.read_text())["acquisition_timing"] != "PASS"
 
 
 def test_missing_common_clock_evidence_is_blocked(tmp_path):
@@ -737,6 +865,10 @@ def _make_real_d405_clock_blocked_session(session, *, exit_code=3):
         "at_ns": 1_100_000_000,
     }
     _write_json(coordinator_path, coordinator)
+    try:
+        _rebuild_fixture(session)
+    except ValueError:
+        pass
 
 
 def test_real_worker_exit3_and_matching_clock_acceptance_remain_blocked(tmp_path):
@@ -883,7 +1015,7 @@ def test_malformed_d405_camera_clock_count_is_fail(tmp_path):
     coordinator["worker_acceptance"]["left"] = acceptance
     _write_json(coordinator_path, coordinator)
     try:
-        _builder().build_index(session)
+        _rebuild_fixture(session)
     except ValueError:
         pass
 
@@ -905,7 +1037,7 @@ def test_current_d405_producer_shape_without_explicit_clock_domain_is_blocked(tm
         coordinator["worker_acceptance"][device] = acceptance
         _write_json(coordinator_path, coordinator)
     try:
-        _builder().build_index(session)
+        _rebuild_fixture(session)
     except ValueError:
         pass
 
@@ -956,7 +1088,7 @@ def test_vendor_sequence_gap_cannot_be_hidden_by_zero_summary(tmp_path):
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
     _refresh_ego_hash_evidence(session)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1027,7 +1159,7 @@ def test_retained_over_hard_limit_row_is_valid_only_when_nontrainable(tmp_path):
         session / "right" / "d405_frames.csv",
         formal_ns=(1_020_000_000, 1_055_000_000, 1_072_700_000, 1_106_000_000),
     )
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1047,6 +1179,9 @@ def test_retained_over_hard_limit_row_is_valid_only_when_nontrainable(tmp_path):
     manifest = json.loads(manifest_path.read_text())
     manifest["output_csv_sha256"] = _sha256(csv_path)
     _write_json(manifest_path, manifest)
+    for path in (session / "quality").iterdir():
+        path.unlink()
+    (session / "quality").rmdir()
 
     exit_code, report = _run(session)
 
@@ -1076,7 +1211,7 @@ def test_skipped_xu_frame_relation_is_blocked(tmp_path):
     }
     coordinator["worker_acceptance"]["ego"] = ego
     _write_json(coordinator_path, coordinator)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1095,7 +1230,7 @@ def test_nested_ego_blocked_check_blocks_even_when_top_status_says_pass(tmp_path
     coordinator = json.loads(coordinator_path.read_text())
     coordinator["worker_acceptance"]["ego"] = acceptance
     _write_json(coordinator_path, coordinator)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1121,7 +1256,7 @@ def test_raw_warmup_and_formal_counts_must_reconcile_with_acceptance(tmp_path, d
             writer = csv.DictWriter(stream, fieldnames=rows[0])
             writer.writeheader()
             writer.writerows(row for row in rows if row["warmup"] == "0")
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1163,7 +1298,7 @@ def test_one_formal_ego_row_cannot_establish_a_measured_rate(tmp_path):
     acceptance["sequence_evidence"]["valid_sequences"] = 1
     _write_json(acceptance_path, acceptance)
     _refresh_ego_hash_evidence(session)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1240,7 +1375,7 @@ def test_ego_video_and_xu_payload_crc_and_coverage_are_independently_verified(
             "".join(json.dumps(row) + "\n" for row in video_rows), encoding="utf-8"
         )
     _refresh_ego_hash_evidence(session)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     report = _verifier().verify_session(session)
 
@@ -1275,7 +1410,7 @@ def test_d405_raw_packet_count_must_cover_declared_parsed_samples(tmp_path):
     coordinator = json.loads(coordinator_path.read_text())
     coordinator["worker_acceptance"]["left"] = acceptance
     _write_json(coordinator_path, coordinator)
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     report = _verifier().verify_session(session)
 
@@ -1289,7 +1424,7 @@ def test_sync_index_without_any_trainable_row_cannot_pass(tmp_path):
         session / "right" / "d405_frames.csv",
         formal_ns=(1_020_000_000, 1_055_000_000, 1_088_000_000, 1_121_000_000),
     )
-    _builder().build_index(session)
+    _rebuild_fixture(session)
 
     exit_code, report = _run(session)
 
@@ -1407,7 +1542,7 @@ def test_output_is_atomic_durable_and_exit_mapping_is_stable(tmp_path, monkeypat
 
     def observe_replace(source, target):
         replacements.append((Path(source), Path(target)))
-        assert Path(source).is_file()
+        assert Path(source).is_dir()
         return real_replace(source, target)
 
     def observe_fsync(path):
@@ -1418,12 +1553,9 @@ def test_output_is_atomic_durable_and_exit_mapping_is_stable(tmp_path, monkeypat
     monkeypatch.setattr(verifier, "_fsync_directory", observe_fsync)
 
     assert verifier.main(["--session", str(session)]) == 0
-    assert [target for _, target in replacements[-2:]] == [
-        session / "quality" / "acquisition_timing.json",
-        session / "quality" / "product_status.json",
-    ]
-    assert fsynced_directories[-2:] == [session / "quality", session / "quality"]
-    assert not list((session / "quality").glob(".*.tmp"))
+    assert [target for _, target in replacements] == [session / "quality"]
+    assert session in fsynced_directories
+    assert not list(session.glob(".quality.*.tmp"))
     assert verifier.exit_code_for_status("PASS") == 0
     assert verifier.exit_code_for_status("FAIL") == 2
     assert verifier.exit_code_for_status("BLOCKED") == 3

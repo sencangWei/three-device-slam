@@ -21,6 +21,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 from three_device_slam.core.model import FrameStamp, Triplet
+from three_device_slam.core.session_lifecycle import (
+    SEAL_NAME,
+    assert_safe_path,
+    canonical_session_root,
+    offline_claim,
+)
 from three_device_slam.synchronization.sync_index import (
     GRID_NS,
     HARD_SPAN_NS,
@@ -30,6 +36,7 @@ from three_device_slam.synchronization.sync_index import (
 
 
 SCHEMA = "ego.three_device.sync_index.v1"
+SEAL_SCHEMA = "three-device-slam.session-seal.v1"
 COORDINATOR_SCHEMA = "ego.three_device.coordinator.v1"
 SOURCE_PATHS = (
     "coordinator.json",
@@ -59,26 +66,55 @@ REASONS = ("within_target", "within_hard_limit", "span_over_hard_limit")
 
 def build_index(session: Path) -> dict:
     """Build and durably publish one session index, returning its manifest."""
-    session = Path(session)
+    with _offline_session_lease(session) as session_root:
+        _reject_active_writer_claims(session_root)
+        seal = _ensure_session_seal(session_root)
+        output_directory = session_root / "sync"
+        existing = assert_safe_path(
+            output_directory, session_root, "sync", kind="directory"
+        )
+        if existing is not None:
+            return _validate_existing_index(session_root, seal)
+        return _build_index_locked(session_root, seal)
+
+
+def _build_index_locked(session: Path, seal: dict) -> dict:
+    source_bytes = _read_sealed_sources(session, seal)
+    csv_bytes, manifest = _build_artifacts(source_bytes, seal, _git_provenance())
+    manifest_bytes = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
     output_directory = session / "sync"
-    output_directory.mkdir(parents=True, exist_ok=True)
-    with _exclusive_publication_lock(output_directory):
-        return _build_index_locked(session, output_directory)
+    temporary_directory = session / f".sync.{uuid.uuid4().hex}.tmp"
+    temporary_directory.mkdir()
+    published = False
+    try:
+        _write_directory_member(
+            temporary_directory, "common_30hz.csv", csv_bytes
+        )
+        _write_directory_member(temporary_directory, "manifest.json", manifest_bytes)
+        _fsync_directory(temporary_directory)
+        _verify_sources_against_seal(session, seal)
+        os.replace(temporary_directory, output_directory)
+        published = True
+        _fsync_directory(session)
+        _validate_existing_index(session, seal)
+    except BaseException:
+        if published:
+            _remove_published_directory(session, output_directory)
+        raise
+    finally:
+        if temporary_directory.exists():
+            _remove_published_directory(session, temporary_directory)
+    return manifest
 
 
-def _build_index_locked(session: Path, output_directory: Path) -> dict:
-    manifest_path = output_directory / "manifest.json"
-    csv_path = output_directory / "common_30hz.csv"
-    _remove_success_manifest(manifest_path)
-
-    source_bytes = {
-        relative: (session / relative).read_bytes() for relative in SOURCE_PATHS
-    }
+def _build_artifacts(
+    source_bytes: dict[str, bytes], seal: dict, git: dict
+) -> tuple[bytes, dict]:
     source_sha256 = {
-        relative: hashlib.sha256(payload).hexdigest()
-        for relative, payload in source_bytes.items()
+        relative: seal["sources"][relative]["sha256"] for relative in SOURCE_PATHS
     }
-
     task_start_ns = _parse_coordinator(source_bytes["coordinator.json"])
     ego = _parse_ego_rows(source_bytes["ego/ego.video.jsonl"], task_start_ns)
     _validate_d405_clock(
@@ -135,32 +171,202 @@ def _build_index_locked(session: Path, output_directory: Path) -> dict:
         "trainable_count": sum(row.trainable for row in triplets),
         "reason_counts": {reason: reason_counts[reason] for reason in REASONS},
         "task_start_ego_frame_ns": task_start_ns,
-        "git": _validated_git_provenance(_git_provenance()),
+        "git": _validated_git_provenance(git),
+        "session_seal_sha256": seal["content_sha256"],
         "output_csv_sha256": hashlib.sha256(csv_bytes).hexdigest(),
     }
-    manifest_bytes = (
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    return csv_bytes, manifest
 
-    csv_temporary = _write_temporary(csv_path, csv_bytes)
-    manifest_temporary = None
+
+def _ensure_session_seal(session: Path) -> dict:
+    seal_path = session / SEAL_NAME
+    existing = assert_safe_path(seal_path, session, SEAL_NAME, kind="file")
+    if existing is not None:
+        seal = _load_json_object(seal_path.read_bytes(), SEAL_NAME)
+        _validate_seal_document(seal)
+        _verify_sources_against_seal(session, seal)
+        return seal
+
+    captured = _capture_sources(session)
+    seal = {
+        "schema": SEAL_SCHEMA,
+        "sources": {
+            relative: {
+                "sha256": captured[relative]["sha256"],
+                "identity": list(captured[relative]["identity"]),
+            }
+            for relative in SOURCE_PATHS
+        },
+    }
+    seal["content_sha256"] = _seal_content_sha256(seal)
+    payload = (json.dumps(seal, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary = session / f".{SEAL_NAME}.{uuid.uuid4().hex}.tmp"
     try:
-        manifest_temporary = _write_temporary(manifest_path, manifest_bytes)
-        _verify_sources_unchanged(session, source_sha256)
-        os.replace(csv_temporary, csv_path)
-        _fsync_directory(output_directory)
-        _verify_sources_unchanged(session, source_sha256)
-        os.replace(manifest_temporary, manifest_path)
-        _fsync_directory(output_directory)
-        _verify_published_outputs(session, csv_path, manifest)
-    except BaseException:
-        _remove_success_manifest(manifest_path)
-        raise
+        _write_directory_member(session, temporary.name, payload)
+        _verify_captured_sources(session, captured)
+        os.replace(temporary, seal_path)
+        _fsync_directory(session)
+        _verify_sources_against_seal(session, seal)
     finally:
-        for temporary in (csv_temporary, manifest_temporary):
-            if temporary is not None and temporary.exists():
-                temporary.unlink()
+        if temporary.exists():
+            temporary.unlink()
+    return seal
+
+
+def _load_existing_session_seal(session: Path) -> dict:
+    seal_path = session / SEAL_NAME
+    if assert_safe_path(seal_path, session, SEAL_NAME, kind="file") is None:
+        raise RuntimeError("session seal is missing")
+    seal = _load_json_object(seal_path.read_bytes(), SEAL_NAME)
+    _validate_seal_document(seal)
+    _verify_sources_against_seal(session, seal)
+    return seal
+
+
+def _validate_seal_document(seal: dict) -> None:
+    if seal.get("schema") != SEAL_SCHEMA:
+        raise ValueError("session seal schema is invalid")
+    sources = seal.get("sources")
+    if not isinstance(sources, dict) or set(sources) != set(SOURCE_PATHS):
+        raise ValueError("session seal sources are invalid")
+    for relative, evidence in sources.items():
+        if not isinstance(evidence, dict) or set(evidence) != {"sha256", "identity"}:
+            raise ValueError(f"session seal evidence is invalid: {relative}")
+        digest = evidence["sha256"]
+        identity = evidence["identity"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(identity, list)
+            or len(identity) != 5
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in identity)
+        ):
+            raise ValueError(f"session seal evidence is invalid: {relative}")
+    if seal.get("content_sha256") != _seal_content_sha256(seal):
+        raise ValueError("session seal content hash is invalid")
+
+
+def _seal_content_sha256(seal: dict) -> str:
+    addressed = {key: value for key, value in seal.items() if key != "content_sha256"}
+    payload = json.dumps(
+        addressed, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _capture_sources(session: Path) -> dict[str, dict]:
+    captured = {}
+    for relative in SOURCE_PATHS:
+        path = session / relative
+        assert_safe_path(path, session, relative, kind="file")
+        with path.open("rb") as stream:
+            before_descriptor = _file_identity(os.fstat(stream.fileno()))
+            before_path = _file_identity(path.stat())
+            payload = stream.read()
+            after_descriptor = _file_identity(os.fstat(stream.fileno()))
+            after_path = _file_identity(path.stat())
+        if not all(
+            observed == before_descriptor
+            for observed in (before_path, after_descriptor, after_path)
+        ):
+            raise RuntimeError(f"source changed while sealing: {relative}")
+        captured[relative] = {
+            "payload": payload,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "identity": before_descriptor,
+        }
+    return captured
+
+
+def _verify_captured_sources(session: Path, expected: dict[str, dict]) -> None:
+    observed = _capture_sources(session)
+    for relative in SOURCE_PATHS:
+        if (
+            observed[relative]["sha256"] != expected[relative]["sha256"]
+            or observed[relative]["identity"] != expected[relative]["identity"]
+        ):
+            raise RuntimeError(f"source changed while sealing: {relative}")
+
+
+def _verify_sources_against_seal(session: Path, seal: dict) -> dict[str, dict]:
+    _validate_seal_document(seal)
+    observed = _capture_sources(session)
+    for relative in SOURCE_PATHS:
+        evidence = seal["sources"][relative]
+        if (
+            observed[relative]["sha256"] != evidence["sha256"]
+            or list(observed[relative]["identity"]) != evidence["identity"]
+        ):
+            raise RuntimeError(f"source does not match session seal: {relative}")
+    return observed
+
+
+def _read_sealed_sources(session: Path, seal: dict) -> dict[str, bytes]:
+    return {
+        relative: evidence["payload"]
+        for relative, evidence in _verify_sources_against_seal(session, seal).items()
+    }
+
+
+def _validate_existing_index(session: Path, seal: dict) -> dict:
+    output_directory = session / "sync"
+    assert_safe_path(output_directory, session, "sync", kind="directory")
+    members = {path.name for path in output_directory.iterdir()}
+    if members != {"common_30hz.csv", "manifest.json"}:
+        raise RuntimeError("existing sync directory is incomplete or has extra members")
+    csv_path = output_directory / "common_30hz.csv"
+    manifest_path = output_directory / "manifest.json"
+    assert_safe_path(csv_path, session, "sync/common_30hz.csv", kind="file")
+    assert_safe_path(manifest_path, session, "sync/manifest.json", kind="file")
+    manifest = _load_json_object(manifest_path.read_bytes(), "sync/manifest.json")
+    source_bytes = _read_sealed_sources(session, seal)
+    expected_csv, expected_manifest = _build_artifacts(
+        source_bytes, seal, manifest.get("git")
+    )
+    if manifest != expected_manifest or csv_path.read_bytes() != expected_csv:
+        raise RuntimeError("existing sync directory does not match sealed inputs")
+    _verify_published_outputs(session, csv_path, manifest)
     return manifest
+
+
+def _write_directory_member(directory: Path, name: str, payload: bytes) -> None:
+    if Path(name).name != name or not name:
+        raise ValueError("publication member name is unsafe")
+    path = directory / name
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _remove_published_directory(session: Path, directory: Path) -> None:
+    info = assert_safe_path(directory, session, directory.name, kind="directory")
+    if info is None:
+        return
+    allowed = {"common_30hz.csv", "manifest.json"}
+    members = list(directory.iterdir())
+    if any(path.name not in allowed for path in members):
+        raise RuntimeError(f"refusing to clean unexpected publication: {directory.name}")
+    for path in members:
+        assert_safe_path(path, session, path.name, kind="file")
+        path.unlink()
+    directory.rmdir()
+    _fsync_directory(session)
+
+
+def _reject_active_writer_claims(session: Path) -> None:
+    for directory in (session, *(session / name for name in ("ego", "left", "right"))):
+        claim = directory / ".writer.lock"
+        if claim.exists() or claim.is_symlink():
+            assert_safe_path(claim, session, str(claim.relative_to(session)), kind="file")
+            raise RuntimeError("session has an active writer")
+
+
+@contextmanager
+def _offline_session_lease(session: Path):
+    with offline_claim(session) as root:
+        yield root
 
 
 def _parse_coordinator(payload: bytes) -> int:
@@ -412,22 +618,6 @@ def _serialize_csv(triplets: list[Triplet]) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(65536), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _verify_sources_unchanged(
-    session: Path, source_sha256: dict[str, str]
-) -> None:
-    for relative, expected_hash in source_sha256.items():
-        if _sha256_file(session / relative) != expected_hash:
-            raise RuntimeError(f"source changed while building: {relative}")
-
-
 def _verify_published_outputs(session: Path, csv_path: Path, manifest: dict) -> None:
     expected_files = {
         "common_30hz.csv": (csv_path, manifest["output_csv_sha256"]),
@@ -507,66 +697,8 @@ def _file_identity(stat_result) -> tuple[int, int, int, int, int]:
 
 @contextmanager
 def _exclusive_publication_lock(output_directory: Path):
-    lock_path = output_directory / ".publication.lock"
-    with lock_path.open("a+b") as stream:
-        try:
-            _lock_stream(stream)
-        except OSError as exc:
-            raise RuntimeError("sync index build already in progress") from exc
-        try:
-            yield
-        finally:
-            _unlock_stream(stream)
-
-
-def _lock_stream(stream) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"\0")
-            stream.flush()
-            os.fsync(stream.fileno())
-        stream.seek(0)
-        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _unlock_stream(stream) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        stream.seek(0)
-        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
-def _write_temporary(final_path: Path, payload: bytes) -> Path:
-    temporary = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        if temporary.exists():
-            temporary.unlink()
-        raise
-    return temporary
-
-
-def _remove_success_manifest(manifest_path: Path) -> None:
-    if not manifest_path.exists():
-        return
-    manifest_path.unlink()
-    _fsync_directory(manifest_path.parent)
+    with _offline_session_lease(output_directory):
+        yield
 
 
 def _fsync_directory(path: Path) -> None:

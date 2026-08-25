@@ -696,6 +696,37 @@ def test_capture_session_directory_preserves_standalone_naming(tmp_path):
     assert capture_session_directory(joint, "ignored") == tmp_path / "joint" / "left"
 
 
+def test_joint_worker_rejects_sealed_session_before_loading_hardware(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "session.seal.json").write_text("sealed", encoding="utf-8")
+    args = parse_args(
+        [
+            "--barrier-dir",
+            str(session),
+            "--session",
+            str(session),
+            "--device-id",
+            "left",
+        ]
+    )
+    hardware_loaded = []
+    monkeypatch.setattr(capture_quality_module, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        capture_quality_module,
+        "_load_hardware_modules",
+        lambda: hardware_loaded.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        capture_quality_module._main()
+
+    assert hardware_loaded == []
+    assert {path.name for path in session.iterdir()} == {"session.seal.json"}
+
+
 def test_joint_reader_keeps_raw_imu_warmup_while_standalone_still_discards_it():
     assert imu_reader_warmup_frames(joint_mode=False) == 500
     assert imu_reader_warmup_frames(joint_mode=True) == 0

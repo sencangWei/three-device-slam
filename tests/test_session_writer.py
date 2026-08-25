@@ -5,6 +5,8 @@ from zlib import crc32
 import pytest
 
 from three_device_slam.core.model import SensorRecord
+from three_device_slam.core import session_lifecycle
+from three_device_slam.core.session_lifecycle import offline_claim, producer_claim
 from three_device_slam.core.session_writer import AppendOnlySessionWriter
 
 
@@ -304,3 +306,79 @@ def test_close_cleanup_does_not_mask_original_error(tmp_path, monkeypatch):
     assert not (tmp_path / ".writer.lock").exists()
     with pytest.raises(RuntimeError, match="terminal"):
         writer.close()
+
+
+def test_producer_and_offline_claims_are_mutually_exclusive_and_cleaned(tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+
+    with producer_claim(session, "ego"):
+        assert (session / ".producer.ego.lock").is_file()
+        with pytest.raises(RuntimeError, match="active producer"):
+            with offline_claim(session):
+                raise AssertionError("offline claim entered")
+    assert not (session / ".producer.ego.lock").exists()
+
+    with offline_claim(session):
+        assert (session / ".offline.lock").is_file()
+        with pytest.raises(RuntimeError, match="offline operation"):
+            with producer_claim(session, "left"):
+                raise AssertionError("producer claim entered")
+    assert not (session / ".offline.lock").exists()
+
+
+@pytest.mark.parametrize("stale", [".producer.ego.lock", ".offline.lock"])
+def test_crash_residue_fails_safe_without_stale_recovery(tmp_path, stale):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / stale).write_bytes(b"")
+
+    claim = offline_claim(session) if stale.startswith(".producer") else producer_claim(
+        session, "right"
+    )
+    with pytest.raises(RuntimeError, match="active producer|offline operation"):
+        with claim:
+            raise AssertionError("stale claim was recovered")
+
+    assert (session / stale).is_file()
+
+
+@pytest.mark.parametrize("marker", ["session.seal.json", ".offline.lock"])
+def test_append_only_writer_rejects_session_lifecycle_marker_before_writing(
+    tmp_path, marker
+):
+    session = tmp_path / "session"
+    ego = session / "ego"
+    ego.mkdir(parents=True)
+    (session / marker).write_text("sealed", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="sealed|offline"):
+        AppendOnlySessionWriter(ego)
+
+    assert list(ego.iterdir()) == []
+
+
+@pytest.mark.parametrize("winner", ["producer", "offline"])
+def test_claim_creation_race_has_exactly_one_winner(tmp_path, monkeypatch, winner):
+    session = tmp_path / "session"
+    session.mkdir()
+    loser_rejected = []
+
+    def interleave(kind, root):
+        if kind != winner:
+            return
+        contender = offline_claim(root) if winner == "producer" else producer_claim(
+            root, "left"
+        )
+        with pytest.raises(RuntimeError):
+            with contender:
+                raise AssertionError("losing claim entered")
+        loser_rejected.append(True)
+
+    monkeypatch.setattr(session_lifecycle, "_claim_created_hook", interleave)
+    winner_claim = (
+        producer_claim(session, "ego") if winner == "producer" else offline_claim(session)
+    )
+
+    with winner_claim:
+        assert loser_rejected == [True]

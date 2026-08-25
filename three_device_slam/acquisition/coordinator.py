@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from three_device_slam.core.barrier import BarrierDirectory
 from three_device_slam.core.joint_gate import GateState, JointWarmupGate
+from three_device_slam.core.session_lifecycle import producer_claim
 
 
 REQUIRED_DEVICES = ("ego", "left", "right")
@@ -51,6 +52,31 @@ def run_coordinator(
     stop_requested: Callable[[], bool] = lambda: False,
 ) -> dict:
     """Run the three capture workers and return their durable coordinator report."""
+    try:
+        with producer_claim(session, "coordinator"):
+            return _run_coordinator_claimed(
+                session,
+                worker_commands,
+                duration_s,
+                clock_ns,
+                auto_start=auto_start,
+                stop_requested=stop_requested,
+            )
+    except OSError as exc:
+        return _initial_storage_failure_report(
+            Path(session), worker_commands, clock_ns(), type(exc).__name__
+        )
+
+
+def _run_coordinator_claimed(
+    session: Path,
+    worker_commands: dict[str, list[str]],
+    duration_s: float | None,
+    clock_ns: Callable[[], int] = time.monotonic_ns,
+    *,
+    auto_start: bool = True,
+    stop_requested: Callable[[], bool] = lambda: False,
+) -> dict:
     session = Path(session)
     _validate_run_inputs(worker_commands, duration_s)
     launch_ns = clock_ns()

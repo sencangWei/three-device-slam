@@ -184,15 +184,41 @@ def _evaluate_session(session: Path) -> dict:
 
 
 def verify_session(session: Path) -> dict:
-    session = Path(session)
-    try:
-        report = _evaluate_session(session)
-    except Exception as exc:
-        sections = {name: Section() for name in REQUIRED_SECTIONS}
-        sections["storage"].fail(f"verification_exception:{type(exc).__name__}")
-        report = _finish(sections)
-    _publish_quality_reports(session, report)
-    return report
+    with sync_builder._offline_session_lease(session) as session_root:
+        boundary_error = None
+        seal = None
+        try:
+            seal = sync_builder._load_existing_session_seal(session_root)
+            sync_directory = session_root / "sync"
+            if sync_builder.assert_safe_path(
+                sync_directory, session_root, "sync", kind="directory"
+            ) is not None:
+                sync_builder._validate_existing_index(session_root, seal)
+        except Exception as exc:
+            boundary_error = exc
+        try:
+            report = _evaluate_session(session_root)
+        except Exception as exc:
+            sections = {name: Section() for name in REQUIRED_SECTIONS}
+            sections["storage"].fail(f"verification_exception:{type(exc).__name__}")
+            report = _finish(sections)
+        if boundary_error is not None:
+            _force_protocol_failure(report, boundary_error)
+        _publish_quality_reports(
+            session_root,
+            report,
+            seal if boundary_error is None else None,
+        )
+        return report
+
+
+def _force_protocol_failure(report: dict, error: Exception) -> None:
+    reason = f"session_protocol:{type(error).__name__}"
+    storage = report["sections"]["storage"]
+    storage["status"] = "FAIL"
+    storage["reasons"] = sorted(set([*storage["reasons"], reason]))
+    report["status"] = "FAIL"
+    report["reasons"] = sorted(set([*report["reasons"], f"storage:{reason}"]))
 
 
 def _check_provenance(
@@ -1489,46 +1515,106 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _write_atomic_json(path, report):
-    payload = (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _publish_quality_reports(session: Path, report: dict) -> None:
+def _publish_quality_reports(session: Path, report: dict, seal: dict | None) -> None:
     quality_directory = session / "quality"
-    quality_directory.mkdir(exist_ok=True)
-    acquisition_path = quality_directory / "acquisition_timing.json"
-    product_path = quality_directory / "product_status.json"
-    final_paths = (acquisition_path, product_path)
-    _remove_quality_reports(quality_directory, final_paths)
+    existing = sync_builder.assert_safe_path(
+        quality_directory, session, "quality", kind="directory"
+    )
+    product_status = compose_product_status(report["status"])
+    if existing is not None:
+        _validate_existing_quality(session, report, product_status)
+        return
+
+    temporary_directory = session / f".quality.{uuid.uuid4().hex}.tmp"
+    temporary_directory.mkdir()
+    published = False
     try:
-        _write_atomic_json(acquisition_path, report)
-        _write_atomic_json(product_path, compose_product_status(report["status"]))
+        _write_quality_member(
+            temporary_directory,
+            "acquisition_timing.json",
+            _json_bytes(report),
+        )
+        _write_quality_member(
+            temporary_directory,
+            "product_status.json",
+            _json_bytes(product_status),
+        )
+        _fsync_directory(temporary_directory)
+        if seal is not None:
+            _validate_sealed_boundary(session, seal)
+        os.replace(temporary_directory, quality_directory)
+        published = True
+        _fsync_directory(session)
+        _validate_existing_quality(session, report, product_status)
+        if seal is not None:
+            _validate_sealed_boundary(session, seal)
     except BaseException:
-        _remove_quality_reports(quality_directory, final_paths)
+        if published:
+            _remove_quality_directory(session, quality_directory)
         raise
+    finally:
+        if temporary_directory.exists():
+            _remove_quality_directory(session, temporary_directory)
 
 
-def _remove_quality_reports(directory: Path, paths: tuple[Path, ...]) -> None:
-    removed = False
-    for path in paths:
-        try:
-            path.unlink()
-            removed = True
-        except FileNotFoundError:
-            pass
-    if removed:
-        _fsync_directory(directory)
+def _json_bytes(value: dict) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _validate_sealed_boundary(session: Path, seal: dict) -> None:
+    sync_builder._verify_sources_against_seal(session, seal)
+    sync_directory = session / "sync"
+    if sync_builder.assert_safe_path(
+        sync_directory, session, "sync", kind="directory"
+    ) is not None:
+        sync_builder._validate_existing_index(session, seal)
+
+
+def _write_quality_member(directory: Path, name: str, payload: bytes) -> None:
+    if Path(name).name != name or not name:
+        raise ValueError("quality member name is unsafe")
+    with (directory / name).open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _validate_existing_quality(
+    session: Path, report: dict, product_status: dict
+) -> None:
+    directory = session / "quality"
+    sync_builder.assert_safe_path(directory, session, "quality", kind="directory")
+    members = {path.name for path in directory.iterdir()}
+    if members != {"acquisition_timing.json", "product_status.json"}:
+        raise RuntimeError("existing quality directory is incomplete or has extra members")
+    expected = {
+        "acquisition_timing.json": report,
+        "product_status.json": product_status,
+    }
+    for name, value in expected.items():
+        path = directory / name
+        sync_builder.assert_safe_path(path, session, f"quality/{name}", kind="file")
+        if _read_json_object(path, f"quality/{name}") != value:
+            raise RuntimeError("existing quality directory does not match verification")
+
+
+def _remove_quality_directory(session: Path, directory: Path) -> None:
+    info = sync_builder.assert_safe_path(
+        directory, session, directory.name, kind="directory"
+    )
+    if info is None:
+        return
+    allowed = {"acquisition_timing.json", "product_status.json"}
+    members = list(directory.iterdir())
+    if any(path.name not in allowed for path in members):
+        raise RuntimeError(f"refusing to clean unexpected publication: {directory.name}")
+    for path in members:
+        sync_builder.assert_safe_path(path, session, path.name, kind="file")
+        path.unlink()
+    directory.rmdir()
+    _fsync_directory(session)
 
 
 def _fsync_directory(path):
@@ -1570,18 +1656,12 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    published = False
     try:
         report = verify_session(args.session)
-        published = True
-    except Exception as exc:
-        sections = {name: Section() for name in REQUIRED_SECTIONS}
-        sections["storage"].fail(f"verification_exception:{type(exc).__name__}")
-        report = _finish(sections)
-    try:
-        if not published:
-            _publish_quality_reports(args.session, report)
     except (OSError, ValueError) as exc:
+        print(f"three-device verification failed: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
         print(f"three-device verification failed: {exc}", file=sys.stderr)
         return 2
     print(json.dumps({"status": report["status"], "reasons": report["reasons"]}, sort_keys=True))

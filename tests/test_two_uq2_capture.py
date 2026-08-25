@@ -1013,6 +1013,25 @@ def test_run_seal_failure_precedes_existing_capture_failure(tmp_path, monkeypatc
     assert report["reason"] == "storage_io"
 
 
+def test_worker_rejects_sealed_session_before_storage_setup(tmp_path, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / "session.seal.json").write_text("sealed", encoding="utf-8")
+    setup_called = []
+    monkeypatch.setattr(
+        two_uq2_worker,
+        "setup_storage",
+        lambda _session: setup_called.append(True),
+    )
+    args = SimpleNamespace(session=session)
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        two_uq2_worker.run(args)
+
+    assert setup_called == []
+    assert {path.name for path in session.iterdir()} == {"session.seal.json"}
+
+
 def test_standalone_start_is_scheduled_in_future_for_raw_warmup():
     barrier = ScheduledBarrier()
     now_ns = 3_000_000_000
