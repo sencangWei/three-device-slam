@@ -1,5 +1,9 @@
 import csv
+import hashlib
+import json
 import struct
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -96,8 +100,10 @@ class FakeGlobalTimeSensor:
 
 
 class FakeBarrier:
-    def __init__(self, start_ns=None):
+    def __init__(self, start_ns=None, stop_record=None):
         self.start_ns = start_ns
+        self.stop_record = stop_record
+        self.stop_reads = 0
         self.heartbeats = []
         self.failures = []
 
@@ -106,6 +112,10 @@ class FakeBarrier:
 
     def write_heartbeat(self, heartbeat):
         self.heartbeats.append(heartbeat)
+
+    def read_stop(self):
+        self.stop_reads += 1
+        return self.stop_record
 
     def latch_failure(self, device_id, reason, at_ns):
         if not self.failures:
@@ -408,6 +418,12 @@ def test_duration_omission_is_indefinite_until_stop():
     assert build_parser().parse_args([]).duration is None
 
 
+@pytest.mark.parametrize("duration", ["nan", "inf", "-inf", "0", "-1"])
+def test_parser_rejects_non_finite_and_non_positive_duration(duration):
+    with pytest.raises(SystemExit):
+        parse_args(["--duration", duration])
+
+
 def test_joint_worker_preserves_product_td():
     assert PRODUCT_CAMERA_IMU_TD_S == -0.009312
 
@@ -473,8 +489,9 @@ def test_joint_arguments_require_session_and_hand_device(tmp_path):
     assert args.device_id == "right"
 
 
-def test_joint_mode_rejects_live_vins_while_standalone_still_supports_it(tmp_path):
-    assert parse_args(["--publish-vins"]).publish_vins
+def test_phase_one_parser_rejects_live_vins_in_all_modes(tmp_path):
+    with pytest.raises(SystemExit):
+        parse_args(["--publish-vins"])
     with pytest.raises(SystemExit):
         parse_args(
             [
@@ -487,6 +504,11 @@ def test_joint_mode_rejects_live_vins_while_standalone_still_supports_it(tmp_pat
                 "--publish-vins",
             ]
         )
+
+
+def test_worker_import_does_not_load_hardware_modules():
+    assert "cv2" not in sys.modules
+    assert "pyrealsense2" not in sys.modules
 
 
 def test_barrier_root_normalizes_session_and_barrier_paths(tmp_path):
@@ -938,6 +960,219 @@ def test_joint_recorder_pause_shutdown_failure_latches_without_raising():
     assert barrier.failures == [("left", "recorder_error", 789)]
 
 
+@pytest.mark.parametrize(
+    ("stop_record", "duration_s"),
+    [
+        ({"at_ns": 100, "reason": "operator_interrupt"}, None),
+        (None, 0.0000001),
+    ],
+)
+def test_terminal_failure_precedes_stop_or_duration_completion(
+    stop_record, duration_s
+):
+    barrier = FakeBarrier(start_ns=0, stop_record=stop_record)
+    controller = JointBarrierController(barrier, "left")
+    controller.start_ns = 0
+
+    with pytest.raises(JointWorkerFailure, match="storage_error"):
+        capture_quality_module.poll_joint_formal_window(
+            controller,
+            now_ns=100,
+            healthy=False,
+            reasons=("storage_error",),
+            terminal_reason="storage_error",
+            start_ns=0,
+            duration_s=duration_s,
+        )
+
+    assert barrier.failures == [("left", "storage_error", 100)]
+    assert barrier.stop_reads == 0
+
+
+def test_joint_finalization_flushes_hashes_then_publishes_acceptance(tmp_path):
+    events = []
+    bag_path = tmp_path / "camera.db3"
+
+    class CameraRecorder:
+        def pause(self):
+            events.append("camera_pause")
+            bag_path.write_bytes(b"camera")
+
+    class TrackingUnitRecorder(capture_quality_module.UnitRecorder):
+        def stop(self, *args, **kwargs):
+            events.append("imu_stop")
+            return super().stop(*args, **kwargs)
+
+    barrier = FakeBarrier()
+    controller = JointBarrierController(barrier, "left")
+    recorder = TrackingUnitRecorder("external_imu", tmp_path, max_queue=8)
+    recorder.start()
+    recorder.put_raw_imu_packet(b"wire-packet")
+
+    shutdown = capture_quality_module.shutdown_capture_outputs(
+        pause_recorder=lambda: pause_joint_recorder_for_shutdown(
+            CameraRecorder(), controller
+        ),
+        stop_sensor=lambda: events.append("sensor_stop"),
+        close_sensor=lambda: events.append("sensor_close"),
+        stop_imu=lambda: events.append("imu_device_stop"),
+        imu_recorder=recorder,
+    )
+    acceptance_path = tmp_path / "acceptance.json"
+    assert not acceptance_path.exists()
+
+    report = capture_quality_module.finalize_joint_outputs(
+        session=tmp_path,
+        report={"result": "PASS"},
+        raw_paths=(
+            bag_path,
+            tmp_path / "external_imu" / "raw_imu_packets.bin",
+        ),
+        camera_recorder_clean_shutdown=shutdown["camera_clean"],
+        imu_recorder_clean_shutdown=shutdown["imu_clean"],
+        recorder_write_error=shutdown["recorder_write_error"],
+        camera_recorder_shutdown_error=shutdown["camera_error"],
+        stage_move_error=None,
+        shutdown_errors=shutdown["errors"],
+    )
+
+    assert events == [
+        "camera_pause",
+        "sensor_stop",
+        "sensor_close",
+        "imu_device_stop",
+        "imu_stop",
+    ]
+    assert acceptance_path.exists()
+    assert json.loads(acceptance_path.read_text()) == report
+    assert report["raw_files"]["camera.db3"]["sha256"] == hashlib.sha256(
+        b"camera"
+    ).hexdigest()
+    assert report["raw_files"]["external_imu/raw_imu_packets.bin"][
+        "sha256"
+    ] == hashlib.sha256(b"wire-packet").hexdigest()
+
+    failed_session = tmp_path / "failed"
+    failed_session.mkdir()
+    failed = capture_quality_module.finalize_joint_outputs(
+        session=failed_session,
+        report={"result": "PASS"},
+        raw_paths=(),
+        camera_recorder_clean_shutdown=False,
+        imu_recorder_clean_shutdown=False,
+        recorder_write_error="TimeoutError: recorder shutdown timed out",
+        camera_recorder_shutdown_error="OSError: recorder pause failed",
+        stage_move_error=None,
+        shutdown_errors=(),
+    )
+
+    assert failed["result"] == "FAIL"
+    assert failed["reason"] == "output_finalization_failed"
+    assert json.loads((failed_session / "acceptance.json").read_text())[
+        "result"
+    ] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "failing_action",
+    ["camera_pause", "sensor_stop", "sensor_close", "imu_stop", "recorder_stop"],
+)
+def test_every_shutdown_fault_forces_failed_acceptance(tmp_path, failing_action):
+    def action(name):
+        def run():
+            if name == failing_action:
+                raise OSError(f"{name} failed")
+
+        return run
+
+    class Recorder:
+        first_write_error = None
+
+        def stop(self):
+            action("recorder_stop")()
+            return True
+
+    shutdown = capture_quality_module.shutdown_capture_outputs(
+        pause_recorder=action("camera_pause"),
+        stop_sensor=action("sensor_stop"),
+        close_sensor=action("sensor_close"),
+        stop_imu=action("imu_stop"),
+        imu_recorder=Recorder(),
+    )
+    report = capture_quality_module.finalize_joint_outputs(
+        session=tmp_path,
+        report={"result": "PASS"},
+        raw_paths=(),
+        camera_recorder_clean_shutdown=shutdown["camera_clean"],
+        imu_recorder_clean_shutdown=shutdown["imu_clean"],
+        recorder_write_error=shutdown["recorder_write_error"],
+        camera_recorder_shutdown_error=shutdown["camera_error"],
+        stage_move_error=None,
+        shutdown_errors=shutdown["errors"],
+    )
+
+    assert report["result"] == "FAIL"
+    assert report["reason"] == "output_finalization_failed"
+    assert any(failing_action in error for error in report["finalization_errors"])
+
+
+def test_live_writer_timeout_publishes_no_unsealed_raw_hashes(tmp_path):
+    class BlockingRawFile:
+        def __init__(self, real_file):
+            self.real_file = real_file
+            self.write_entered = threading.Event()
+            self.release_write = threading.Event()
+
+        def write(self, data):
+            self.write_entered.set()
+            self.release_write.wait(timeout=2.0)
+            return self.real_file.write(data)
+
+        def flush(self):
+            return self.real_file.flush()
+
+        def close(self):
+            return self.real_file.close()
+
+    class ShortTimeoutRecorder(capture_quality_module.UnitRecorder):
+        def stop(self):
+            return super().stop(timeout_s=0.02)
+
+    recorder = ShortTimeoutRecorder("external_imu", tmp_path, max_queue=8)
+    recorder.start()
+    blocked_file = BlockingRawFile(recorder._raw_imu_fp)
+    recorder._raw_imu_fp = blocked_file
+    recorder.put_raw_imu_packet(b"still-writing")
+    assert blocked_file.write_entered.wait(timeout=1.0)
+
+    try:
+        shutdown = capture_quality_module.shutdown_capture_outputs(
+            pause_recorder=None,
+            stop_sensor=None,
+            close_sensor=None,
+            stop_imu=None,
+            imu_recorder=recorder,
+        )
+        report = capture_quality_module.finalize_joint_outputs(
+            session=tmp_path,
+            report={"result": "PASS"},
+            raw_paths=(tmp_path / "external_imu" / "raw_imu_packets.bin",),
+            camera_recorder_clean_shutdown=shutdown["camera_clean"],
+            imu_recorder_clean_shutdown=shutdown["imu_clean"],
+            recorder_write_error=shutdown["recorder_write_error"],
+            camera_recorder_shutdown_error=shutdown["camera_error"],
+            stage_move_error=None,
+            shutdown_errors=shutdown["errors"],
+        )
+
+        assert recorder._thread.is_alive()
+        assert report["result"] == "FAIL"
+        assert report["raw_files"] == {}
+    finally:
+        blocked_file.release_write.set()
+        capture_quality_module.UnitRecorder.stop(recorder, timeout_s=1.0)
+
+
 def test_joint_imu_acceptance_requires_clean_persisted_formal_lower_bound():
     assert persisted_imu_covers_formal(
         clean_shutdown=True, persisted_samples=500, formal_samples=400
@@ -967,3 +1202,29 @@ def test_indefinite_window_continues_without_stop():
         duration_s=None,
         stop_record=None,
     )
+
+
+def test_positive_duration_window_completes_at_deadline():
+    assert not capture_quality_module.formal_window_complete(
+        now_ns=99,
+        start_ns=0,
+        duration_s=0.0000001,
+        stop_record=None,
+    )
+    assert capture_quality_module.formal_window_complete(
+        now_ns=100,
+        start_ns=0,
+        duration_s=0.0000001,
+        stop_record=None,
+    )
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_formal_window_rejects_invalid_explicit_duration(duration):
+    with pytest.raises(ValueError, match="finite and positive"):
+        capture_quality_module.formal_window_complete(
+            now_ns=100,
+            start_ns=0,
+            duration_s=duration,
+            stop_record=None,
+        )

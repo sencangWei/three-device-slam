@@ -362,6 +362,114 @@ def write_atomic_json(path: Path, payload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def shutdown_capture_outputs(
+    *,
+    pause_recorder,
+    stop_sensor,
+    close_sensor,
+    stop_imu,
+    imu_recorder,
+) -> dict:
+    errors = []
+    camera_error = None
+    camera_clean = True
+    imu_clean = True
+    recorder_write_error = None
+
+    if pause_recorder is not None:
+        try:
+            camera_error = pause_recorder()
+        except Exception as exc:
+            camera_error = f"{type(exc).__name__}: {exc}"
+        if camera_error is not None:
+            camera_clean = False
+            errors.append(f"camera_pause: {camera_error}")
+
+    for name, action in (
+        ("sensor_stop", stop_sensor),
+        ("sensor_close", close_sensor),
+        ("imu_stop", stop_imu),
+    ):
+        if action is None:
+            continue
+        try:
+            action()
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    if imu_recorder is not None:
+        try:
+            imu_clean = bool(imu_recorder.stop())
+        except Exception as exc:
+            imu_clean = False
+            errors.append(f"recorder_stop: {type(exc).__name__}: {exc}")
+        recorder_write_error = imu_recorder.first_write_error
+        if not imu_clean and recorder_write_error is None:
+            errors.append("recorder_stop: recorder shutdown timed out")
+        if recorder_write_error is not None:
+            errors.append(f"recorder_write: {recorder_write_error}")
+
+    return {
+        "camera_clean": camera_clean,
+        "camera_error": camera_error,
+        "imu_clean": imu_clean,
+        "recorder_write_error": recorder_write_error,
+        "errors": tuple(errors),
+    }
+
+
+def finalize_joint_outputs(
+    *,
+    session: Path,
+    report: dict,
+    raw_paths,
+    camera_recorder_clean_shutdown: bool,
+    imu_recorder_clean_shutdown: bool,
+    recorder_write_error: str | None,
+    camera_recorder_shutdown_error: str | None,
+    stage_move_error: str | None,
+    shutdown_errors=(),
+) -> dict:
+    finalization_errors = tuple(
+        error
+        for error in (
+            None
+            if camera_recorder_clean_shutdown
+            else camera_recorder_shutdown_error or "camera recorder shutdown failed",
+            None
+            if imu_recorder_clean_shutdown
+            else recorder_write_error or "IMU recorder shutdown failed",
+            recorder_write_error,
+            stage_move_error,
+            *shutdown_errors,
+        )
+        if error is not None
+    )
+    if finalization_errors:
+        report["result"] = "FAIL"
+        report["reason"] = "output_finalization_failed"
+        report["finalization_errors"] = list(dict.fromkeys(finalization_errors))
+    outputs_sealed = (
+        camera_recorder_clean_shutdown
+        and imu_recorder_clean_shutdown
+        and recorder_write_error is None
+        and camera_recorder_shutdown_error is None
+        and stage_move_error is None
+    )
+    if not outputs_sealed:
+        report["raw_files"] = {}
+    else:
+        try:
+            report["raw_files"] = build_raw_file_manifest(session, raw_paths)
+        except (OSError, ValueError) as exc:
+            report["result"] = "FAIL"
+            report["reason"] = "raw_manifest_failed"
+            report["raw_files"] = {}
+            report["finalization_errors"] = [f"{type(exc).__name__}: {exc}"]
+    write_atomic_json(Path(session) / "acceptance.json", report)
+    return report
+
+
 def run_prestart_step(
     controller, reason: str, action, *, clock_ns=time.monotonic_ns
 ):
@@ -1025,7 +1133,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--publish-vins",
         action="store_true",
-        help="将同一份双IR/IMU实时发布给已启动的VINS；不另开相机或串口",
+        help="unsupported in the isolated phase-one capture worker",
     )
     parser.add_argument(
         "--vins-imu-calibration",
@@ -1055,16 +1163,17 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv=None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.duration is not None and (
+        not math.isfinite(args.duration) or args.duration <= 0
+    ):
+        parser.error("--duration must be finite and positive")
+    if args.publish_vins:
+        parser.error("--publish-vins is unavailable in phase-one capture")
     if args.barrier_dir is not None:
         if args.device_id not in {"left", "right"}:
             parser.error("--device-id must be left or right with --barrier-dir")
         if args.session is None:
             parser.error("--session is required with --barrier-dir")
-        if args.publish_vins:
-            parser.error(
-                "--publish-vins is not supported with --barrier-dir; "
-                "joint acquisition is offline"
-            )
     elif args.device_id != "d405":
         parser.error("left/right --device-id requires --barrier-dir")
     return args
@@ -1081,11 +1190,40 @@ def imu_reader_warmup_frames(joint_mode: bool) -> int:
 
 
 def formal_window_complete(*, now_ns, start_ns, duration_s, stop_record):
+    if duration_s is not None and (
+        not math.isfinite(duration_s) or duration_s <= 0
+    ):
+        raise ValueError("duration_s must be finite and positive")
     if stop_record is not None:
         return True
     if duration_s is None:
         return False
     return now_ns >= start_ns + int(duration_s * 1_000_000_000)
+
+
+def poll_joint_formal_window(
+    controller,
+    *,
+    now_ns: int,
+    healthy: bool,
+    reasons: tuple[str, ...],
+    terminal_reason: str | None,
+    start_ns: int,
+    duration_s: float | None,
+) -> bool:
+    controller.poll(
+        now_ns,
+        healthy,
+        reasons,
+        terminal_reason=terminal_reason,
+    )
+    stop_record = controller.barrier.read_stop()
+    return formal_window_complete(
+        now_ns=now_ns,
+        start_ns=start_ns,
+        duration_s=duration_s,
+        stop_record=stop_record,
+    )
 
 
 def required_staging_bytes(duration_s: float | None) -> int:
@@ -1185,8 +1323,8 @@ def preview_mosaic(frame_map: dict) -> np.ndarray:
 
 def _main() -> int:
     global STREAMS, STREAM_KEYS, CAMERA_RAW_BYTES_PER_SECOND
-    _load_hardware_modules()
     args = parse_args()
+    _load_hardware_modules()
     STREAMS = capture_streams_for_mode(args.capture_mode)
     STREAM_KEYS = tuple(name for name, *_ in STREAMS)
     CAMERA_RAW_BYTES_PER_SECOND = 1280 * 720 * (2 + 1 + 1) * 30
@@ -1413,6 +1551,7 @@ def _main() -> int:
     imu_recorder_clean_shutdown = True
     camera_recorder_clean_shutdown = True
     camera_recorder_shutdown_error = None
+    shutdown_errors = ()
     imu_started = False
     sensor_opened = False
     sensor_started = False
@@ -1423,10 +1562,6 @@ def _main() -> int:
     camera_clock_evidence = None
     epoch_offset = time.time() - time.monotonic()
     prestart_failure_reason = "camera_disconnect" if joint_mode else None
-    if args.publish_vins:
-        raise RuntimeError(
-            "--publish-vins is unavailable in the isolated phase-one worker"
-        )
     try:
         prestart_failure_reason = "storage_error" if joint_mode else None
         run_prestart_step(joint_controller, "storage_error", imu_recorder.start)
@@ -1643,15 +1778,14 @@ def _main() -> int:
                 frame = frame_queue.poll_for_frame()
                 now_ns = time.monotonic_ns()
                 healthy, reasons, terminal_reason = current_joint_health(now_ns, True)
-                joint_controller.poll(
-                    now_ns, healthy, reasons, terminal_reason=terminal_reason
-                )
-                stop_record = joint_controller.barrier.read_stop()
-                if formal_window_complete(
+                if poll_joint_formal_window(
+                    joint_controller,
                     now_ns=now_ns,
+                    healthy=healthy,
+                    reasons=reasons,
+                    terminal_reason=terminal_reason,
                     start_ns=formal_start_host_ns,
                     duration_s=args.duration,
-                    stop_record=stop_record,
                 ):
                     break
                 if not frame:
@@ -1750,57 +1884,45 @@ def _main() -> int:
         recording_active.clear()
         if formal_start_mono is not None and formal_stop_mono is None:
             formal_stop_mono = time.monotonic()
-        if recorder_resumed:
-            if joint_controller is not None:
-                camera_recorder_shutdown_error = (
-                    pause_joint_recorder_for_shutdown(
-                        recorder_device, joint_controller
-                    )
-                )
-                if camera_recorder_shutdown_error is not None:
-                    camera_recorder_clean_shutdown = False
-                    if capture_error is None:
-                        capture_error = (
-                            "RealSense recorder shutdown failed: "
-                            f"{camera_recorder_shutdown_error}"
-                        )
-            else:
-                try:
-                    recorder_device.pause()
-                except Exception:
-                    pass
         if imu_started:
             imu_stats_end = imu.stats_since_warmup()
-        if sensor_started:
-            try:
-                sensor.stop()
-            except Exception:
-                pass
-        if sensor_opened:
-            try:
-                sensor.close()
-            except Exception:
-                pass
-        if imu_started:
-            imu.stop()
-        if imu_recorder_started:
-            imu_recorder_clean_shutdown = imu_recorder.stop()
-            recorder_shutdown_error = imu_recorder.first_write_error
-            if joint_controller is not None and (
-                not imu_recorder_clean_shutdown
-                or recorder_shutdown_error is not None
-            ):
+        pause_recorder = None
+        if recorder_resumed:
+            if joint_controller is not None:
+                pause_recorder = lambda: pause_joint_recorder_for_shutdown(
+                    recorder_device, joint_controller
+                )
+            else:
+                pause_recorder = recorder_device.pause
+        shutdown = shutdown_capture_outputs(
+            pause_recorder=pause_recorder,
+            stop_sensor=sensor.stop if sensor_started else None,
+            close_sensor=sensor.close if sensor_opened else None,
+            stop_imu=imu.stop if imu_started else None,
+            imu_recorder=imu_recorder if imu_recorder_started else None,
+        )
+        camera_recorder_clean_shutdown = shutdown["camera_clean"]
+        camera_recorder_shutdown_error = shutdown["camera_error"]
+        imu_recorder_clean_shutdown = shutdown["imu_clean"]
+        recorder_shutdown_error = shutdown["recorder_write_error"]
+        shutdown_errors = shutdown["errors"]
+        if shutdown_errors:
+            if capture_error is None:
+                capture_error = "; ".join(shutdown_errors)
+            if joint_controller is not None:
                 try:
                     joint_controller.barrier.latch_failure(
-                        args.device_id, "storage_error", time.monotonic_ns()
+                        args.device_id,
+                        (
+                            "storage_error"
+                            if not imu_recorder_clean_shutdown
+                            or recorder_shutdown_error is not None
+                            else "capture_error"
+                        ),
+                        time.monotonic_ns(),
                     )
                 except (OSError, ValueError):
                     pass
-                if capture_error is None:
-                    capture_error = (
-                        recorder_shutdown_error
-                        or "TimeoutError: recorder shutdown timed out"
-                    )
         if vins_bridge is not None:
             live_vins_transport = vins_bridge.transport_stats()
             vins_bridge.close()
@@ -2008,17 +2130,14 @@ def _main() -> int:
         live_vins_ok,
         camera_clock_verified if joint_mode else True,
     )
-    raw_files = build_raw_file_manifest(
-        session,
-        (
-            bag_path,
-            session / "external_imu" / "raw_imu_packets.bin",
-            session / "external_imu" / "imu.bin",
-            session / "external_imu" / "imu_ts.csv",
-            session / "external_imu" / "gripper_encoder.csv",
-            frame_csv_path,
-            gripper_alignment_path,
-        ),
+    raw_paths = (
+        bag_path,
+        session / "external_imu" / "raw_imu_packets.bin",
+        session / "external_imu" / "imu.bin",
+        session / "external_imu" / "imu_ts.csv",
+        session / "external_imu" / "gripper_encoder.csv",
+        frame_csv_path,
+        gripper_alignment_path,
     )
     report = {
         "result": result,
@@ -2123,7 +2242,6 @@ def _main() -> int:
             ),
             "transport": live_vins_transport,
         },
-        "raw_files": raw_files,
         "raw_integrity_semantics": (
             "raw_imu_packets.bin stores header/length-framed wire candidates before "
             "parsing; KT checksum/STM32 CRC remain separate parser aggregate evidence, "
@@ -2150,7 +2268,17 @@ def _main() -> int:
             first_formal_imu_counter=formal_start_imu_counter,
             clock_domain=joint_clock_domain,
         )
-    write_atomic_json(session / "acceptance.json", report)
+    report = finalize_joint_outputs(
+        session=session,
+        report=report,
+        raw_paths=raw_paths,
+        camera_recorder_clean_shutdown=camera_recorder_clean_shutdown,
+        imu_recorder_clean_shutdown=imu_recorder_clean_shutdown,
+        recorder_write_error=recorder_write_error,
+        camera_recorder_shutdown_error=camera_recorder_shutdown_error,
+        stage_move_error=stage_move_error,
+        shutdown_errors=shutdown_errors,
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return {"PASS": 0, "FAIL": 2, "BLOCKED": 3}[report["result"]]
 
