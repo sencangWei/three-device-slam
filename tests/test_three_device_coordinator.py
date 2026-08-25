@@ -603,6 +603,125 @@ def test_recording_heartbeat_disconnect_fails_but_allows_natural_finalization(
     assert not any(process.terminate_called for process in processes.values())
 
 
+def test_unbounded_heartbeat_disconnect_publishes_stop_and_finishes(
+    tmp_path, monkeypatch
+):
+    session, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        clock=FakeClock(fail_after_ns=10_000_000_000),
+        behaviors={
+            "left": {
+                "stop_heartbeat_after_start_ns": 100_000_000,
+                "exit_on_stop": True,
+            },
+            "ego": {"exit_on_stop": True},
+            "right": {"exit_on_stop": True},
+        },
+    )
+
+    stop = json.loads((session / "barrier" / "stop.json").read_text())
+    assert stop["at_ns"] == report["first_error"]["at_ns"]
+    assert stop["reason"] == "worker_failure"
+    assert report["reason"] == "worker_disconnect"
+    assert all(process.finalized_naturally for process in processes.values())
+
+
+def test_unbounded_recording_timestamp_regression_publishes_stop_and_finishes(
+    tmp_path, monkeypatch
+):
+    session, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        clock=FakeClock(fail_after_ns=10_000_000_000),
+        behaviors={
+            "left": {
+                "heartbeat_interval_ns": 50_000_000,
+                "heartbeat_timestamp": lambda now, _count: (
+                    now if now < 6_000_000_000 else 0
+                ),
+                "exit_on_stop": True,
+            },
+            "ego": {"exit_on_stop": True},
+            "right": {"exit_on_stop": True},
+        },
+    )
+
+    stop = json.loads((session / "barrier" / "stop.json").read_text())
+    assert stop["at_ns"] == report["first_error"]["at_ns"]
+    assert stop["reason"] == "worker_failure"
+    assert report["reason"] == "timestamp_regression"
+    assert all(process.finalized_naturally for process in processes.values())
+
+
+@pytest.mark.parametrize(
+    ("method_name", "error"),
+    [
+        ("read_heartbeats", OSError("heartbeat read failed")),
+        ("read_failures", json.JSONDecodeError("failure read failed", "{", 0)),
+    ],
+    ids=("heartbeat-io", "failure-json"),
+)
+def test_unbounded_recording_barrier_read_failure_publishes_stop_and_finishes(
+    tmp_path, monkeypatch, method_name, error
+):
+    original = getattr(coordinator.BarrierDirectory, method_name)
+
+    def fail_during_recording(barrier):
+        if barrier.read_start_ns() is not None:
+            raise error
+        return original(barrier)
+
+    monkeypatch.setattr(
+        coordinator.BarrierDirectory, method_name, fail_during_recording
+    )
+    session, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        clock=FakeClock(fail_after_ns=10_000_000_000),
+        behaviors={device: {"exit_on_stop": True} for device in DEVICES},
+    )
+
+    stop = json.loads((session / "barrier" / "stop.json").read_text())
+    assert stop["at_ns"] == report["first_error"]["at_ns"]
+    assert stop["reason"] == "worker_failure"
+    assert report["reason"] == "barrier_io"
+    assert all(process.finalized_naturally for process in processes.values())
+
+
+def test_unbounded_stop_publication_failure_is_bounded(tmp_path, monkeypatch):
+    original_read_heartbeats = coordinator.BarrierDirectory.read_heartbeats
+
+    def fail_recording_read(barrier):
+        if barrier.read_start_ns() is not None:
+            raise OSError("heartbeat read failed")
+        return original_read_heartbeats(barrier)
+
+    monkeypatch.setattr(
+        coordinator.BarrierDirectory, "read_heartbeats", fail_recording_read
+    )
+    monkeypatch.setattr(
+        coordinator.BarrierDirectory,
+        "request_stop",
+        lambda *_args: (_ for _ in ()).throw(OSError("stop write failed")),
+    )
+    session, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        clock=FakeClock(fail_after_ns=40_000_000_000),
+    )
+
+    assert not (session / "barrier" / "stop.json").exists()
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "worker_stop_timeout"
+    assert report["first_error"]["reason"] == "barrier_io"
+    assert all(process.terminate_called for process in processes.values())
+
+
 def test_recording_failure_survives_barrier_latch_io_error(tmp_path, monkeypatch):
     def fail_latch(_self, _device_id, _reason, _at_ns):
         raise OSError("barrier unavailable")
@@ -1155,6 +1274,77 @@ def test_invalid_acceptance_leaf_is_fail_closed(
     assert evidence["available"] is False
     if device_id == "ego":
         assert report["task_start_ego_frame_ns"] is None
+
+
+@pytest.mark.parametrize(
+    ("device_id", "payload"),
+    [
+        ("left", {"result": "PASS", "reason": "", "live_vins": {}}),
+        ("left", {"result": "FAIL", "reason": "   ", "live_vins": {}}),
+        ("right", {"result": "BLOCKED", "live_vins": {}}),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "FAIL",
+                "reason": "",
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "BLOCKED",
+                "reason": "   ",
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+    ],
+    ids=(
+        "d405-pass-empty",
+        "d405-fail-whitespace",
+        "d405-blocked-missing",
+        "ego-fail-empty",
+        "ego-blocked-whitespace",
+    ),
+)
+def test_invalid_acceptance_reason_is_fail_closed(
+    tmp_path, monkeypatch, device_id, payload
+):
+    _, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors={device_id: {"acceptance_payload": payload}},
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "worker_acceptance_invalid"
+    assert report["first_error"]["device_id"] == device_id
+    assert report["calibration_evidence_ids"][device_id]["available"] is False
+
+
+@pytest.mark.parametrize(
+    ("device_id", "payload"),
+    [
+        ("left", {"result": "FAIL", "live_vins": {}}),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "FAIL",
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+    ],
+)
+def test_formal_fail_acceptance_can_use_check_details_without_reason(
+    device_id, payload
+):
+    assert coordinator._validated_acceptance_status(device_id, payload) == "FAIL"
 
 
 def test_cli_builds_current_session_root_worker_contract(tmp_path, monkeypatch):

@@ -122,6 +122,10 @@ def run_coordinator(
             )
             latch_error("barrier_io", at_ns)
 
+    def fail_stop(reason: str, at_ns: int, alive_devices, **details) -> None:
+        latch_error(reason, at_ns, **details)
+        publish_stop(at_ns, "worker_failure", alive_devices)
+
     try:
         for device in REQUIRED_DEVICES:
             processes[device] = _popen(worker_commands[device], shell=False)
@@ -165,19 +169,26 @@ def run_coordinator(
             coordinator_errors.append(
                 {"reason": "barrier_io", "at_ns": now_ns, "detail": type(exc).__name__}
             )
-            latch_error("barrier_io", now_ns)
             observed_failures = {}
             if scheduled_start_ns is None:
+                latch_error("barrier_io", now_ns)
                 prestart_terminal = True
+            else:
+                fail_stop("barrier_io", now_ns, alive_this_poll)
         for device, failure in observed_failures.items():
             if device not in barrier_failures:
                 barrier_failures[device] = failure
-                latch_error(failure["reason"], failure["at_ns"], device_id=device)
                 if scheduled_start_ns is None:
+                    latch_error(
+                        failure["reason"], failure["at_ns"], device_id=device
+                    )
                     prestart_terminal = True
-                elif stop_boundary_ns is None:
-                    publish_stop(
-                        failure["at_ns"], "worker_failure", alive_this_poll
+                else:
+                    fail_stop(
+                        failure["reason"],
+                        failure["at_ns"],
+                        alive_this_poll,
+                        device_id=device,
                     )
 
         for device, exit_code in newly_exited:
@@ -191,13 +202,22 @@ def run_coordinator(
                 "observed_running_at_or_after_formal_end": proof,
             }
             if device not in barrier_failures and (early or exit_code != 0):
-                latch_error("worker_exit", now_ns, device_id=device, exit_code=exit_code)
                 if (
                     scheduled_start_ns is not None
                     and stop_boundary_ns is None
                     and (formal_end_ns is None or now_ns < formal_end_ns)
                 ):
-                    publish_stop(now_ns, "worker_failure", alive_this_poll)
+                    fail_stop(
+                        "worker_exit",
+                        now_ns,
+                        alive_this_poll,
+                        device_id=device,
+                        exit_code=exit_code,
+                    )
+                else:
+                    latch_error(
+                        "worker_exit", now_ns, device_id=device, exit_code=exit_code
+                    )
             if scheduled_start_ns is None:
                 prestart_terminal = True
 
@@ -217,7 +237,7 @@ def run_coordinator(
                             "detail": type(exc).__name__,
                         }
                     )
-                    latch_error("barrier_io", now_ns)
+                    fail_stop("barrier_io", now_ns, alive_this_poll)
                     recording_heartbeats = {}
                 for device, heartbeat in recording_heartbeats.items():
                     if heartbeat.at_ns == last_heartbeat_ns.get(device):
@@ -225,7 +245,12 @@ def run_coordinator(
                     try:
                         gate.observe(heartbeat)
                     except ValueError:
-                        latch_error("timestamp_regression", now_ns, device_id=device)
+                        fail_stop(
+                            "timestamp_regression",
+                            now_ns,
+                            alive_this_poll,
+                            device_id=device,
+                        )
                         if device not in barrier_failures:
                             if _safe_latch_failure(
                                 barrier,
@@ -253,7 +278,12 @@ def run_coordinator(
                         now_ns - heartbeat_ns > HEARTBEAT_STALE_NS
                         and device not in barrier_failures
                     ):
-                        latch_error("worker_disconnect", now_ns, device_id=device)
+                        fail_stop(
+                            "worker_disconnect",
+                            now_ns,
+                            alive_this_poll,
+                            device_id=device,
+                        )
                         if _safe_latch_failure(
                             barrier,
                             device,
@@ -839,7 +869,9 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
     if not isinstance(acceptance, Mapping):
         return None
     reason = acceptance.get("reason")
-    if reason is not None and not isinstance(reason, str):
+    if reason is not None and (
+        not isinstance(reason, str) or not reason.strip()
+    ):
         return None
     if device_id == "ego":
         if acceptance.get("schema") != "ego.2uq2.acceptance.v1":
@@ -882,11 +914,11 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
         ):
             return None
         status = acceptance.get("result")
-    return (
-        status
-        if isinstance(status, str) and status in {"PASS", "FAIL", "BLOCKED"}
-        else None
-    )
+    if not isinstance(status, str) or status not in {"PASS", "FAIL", "BLOCKED"}:
+        return None
+    if status == "BLOCKED" and reason is None:
+        return None
+    return status
 
 
 def _task_start_ego_frame_ns(acceptance, scheduled_start_ns):
