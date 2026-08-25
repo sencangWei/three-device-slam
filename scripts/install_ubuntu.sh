@@ -152,6 +152,46 @@ validate_existing_library() {
   validate_bridge "$bridge"
 }
 
+_runtime_parent_directory_accessible() {
+  local directory=$1 install_root=$2 mode
+  [[ -d ${directory} && ! -L ${directory} ]] || return 1
+  mode=$(stat -c '%a' -- "$directory") || return 1
+  if [[ ${directory} == "${install_root}" ]]; then
+    [[ ${mode} == 755 ]]
+  else
+    (( (8#${mode} & 8#001) == 8#001 ))
+  fi
+}
+
+require_runtime_parent_access() {
+  local install_root=$1 runtime_root=${2:-"${1}/venv"}
+  local canonical_root canonical_runtime current component
+  local -a components
+  [[ ${install_root} == /* && ${runtime_root} == /* ]] \
+    || fail "FAIL/untrusted_installation"
+  canonical_root=$(readlink -f -- "$install_root") \
+    || fail "FAIL/untrusted_installation"
+  canonical_runtime=$(readlink -f -- "$runtime_root") \
+    || fail "FAIL/untrusted_installation"
+  [[ ${canonical_root} == "${install_root}" \
+      && ${canonical_runtime} == "${runtime_root}" ]] \
+    || fail "FAIL/untrusted_installation"
+  case ${runtime_root} in
+    "${install_root}"|"${install_root}"/*) ;;
+    *) fail "FAIL/untrusted_installation" ;;
+  esac
+  require_trusted_path "$runtime_root"
+  _runtime_parent_directory_accessible / "$install_root" \
+    || fail "FAIL/untrusted_installation"
+  current=/
+  IFS='/' read -r -a components <<<"${runtime_root#/}"
+  for component in "${components[@]}"; do
+    current="${current%/}/${component}"
+    _runtime_parent_directory_accessible "$current" "$install_root" \
+      || fail "FAIL/untrusted_installation"
+  done
+}
+
 _venv_runtime_entry_accessible() {
   local entry=$1 expected_type=$2 required_bits=$3 resolved mode
   if [[ -L ${entry} ]]; then
@@ -220,6 +260,7 @@ validate_python_runtime() {
   local install_root=$1 python=$2
   require_trusted_tree "${install_root}/venv"
   require_trusted_file "$python"
+  require_runtime_parent_access "$install_root"
   require_venv_runtime_access "${install_root}/venv"
   "$python" -I -B -m pip --version >/dev/null 2>&1 || fail "FAIL/tool_missing:pip"
 }
@@ -357,6 +398,7 @@ create_new_venv() {
   temporary_venv_identity=
   sync -f "$install_root"
   require_trusted_tree "$final_venv"
+  require_runtime_parent_access "$install_root" "$final_venv"
 }
 
 ensure_venv() {
@@ -470,6 +512,7 @@ publish_bridge() {
 install_runtime() {
   local artifact=$1 install_root=$2 repo_root=$3 python
   [[ ${python_venv_capability_checked} == true ]] || probe_python_venv
+  require_runtime_parent_access "$install_root" "$install_root"
   prepare_bridge "$artifact" "$install_root"
   python="${install_root}/venv/bin/python"
   ensure_venv "$install_root"
@@ -509,6 +552,7 @@ main() {
   acquire_install_lock /run/three-device-slam/install.lock
   install_root=/opt/three-device-slam
   ensure_root_directory "$install_root"
+  require_runtime_parent_access "$install_root" "$install_root"
   require_trusted_tree "$install_root" "${install_root}/venv/lib64"
   ensure_root_directory /etc/three-device-slam
   require_trusted_tree /etc/three-device-slam

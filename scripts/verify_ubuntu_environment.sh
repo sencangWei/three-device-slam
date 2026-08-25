@@ -97,6 +97,46 @@ validate_bridge_manifest() {
     || fail "FAIL/xu_bridge_hash"
 }
 
+_runtime_parent_directory_accessible() {
+  local directory=$1 install_root=$2 mode
+  [[ -d ${directory} && ! -L ${directory} ]] || return 1
+  mode=$(stat -c '%a' -- "$directory") || return 1
+  if [[ ${directory} == "${install_root}" ]]; then
+    [[ ${mode} == 755 ]]
+  else
+    (( (8#${mode} & 8#001) == 8#001 ))
+  fi
+}
+
+require_runtime_parent_access() {
+  local install_root=$1 runtime_root=${2:-"${1}/venv"}
+  local canonical_root canonical_runtime current component
+  local -a components
+  [[ ${install_root} == /* && ${runtime_root} == /* ]] \
+    || fail "FAIL/untrusted_installation"
+  canonical_root=$(readlink -f -- "$install_root") \
+    || fail "FAIL/untrusted_installation"
+  canonical_runtime=$(readlink -f -- "$runtime_root") \
+    || fail "FAIL/untrusted_installation"
+  [[ ${canonical_root} == "${install_root}" \
+      && ${canonical_runtime} == "${runtime_root}" ]] \
+    || fail "FAIL/untrusted_installation"
+  case ${runtime_root} in
+    "${install_root}"|"${install_root}"/*) ;;
+    *) fail "FAIL/untrusted_installation" ;;
+  esac
+  require_trusted_path "$runtime_root"
+  _runtime_parent_directory_accessible / "$install_root" \
+    || fail "FAIL/untrusted_installation"
+  current=/
+  IFS='/' read -r -a components <<<"${runtime_root#/}"
+  for component in "${components[@]}"; do
+    current="${current%/}/${component}"
+    _runtime_parent_directory_accessible "$current" "$install_root" \
+      || fail "FAIL/untrusted_installation"
+  done
+}
+
 _venv_runtime_entry_accessible() {
   local entry=$1 expected_type=$2 required_bits=$3 resolved mode
   if [[ -L ${entry} ]]; then
@@ -165,6 +205,7 @@ verify_python_runtime() {
   local install_root=$1 python="${1}/venv/bin/python"
   require_trusted_tree "${install_root}/venv"
   require_trusted_file "$python"
+  require_runtime_parent_access "$install_root"
   require_venv_runtime_access "${install_root}/venv"
   "$python" -I -B -c 'import three_device_slam' || fail "FAIL/python_package_missing"
 }

@@ -458,6 +458,7 @@ def test_python_runtime_validates_full_venv_before_first_execution(tmp_path):
 source "{script}"
 require_trusted_tree() {{ echo tree >>"{trace}"; }}
 require_trusted_file() {{ echo file >>"{trace}"; }}
+require_runtime_parent_access() {{ :; }}
 validate_python_runtime "{install_root}" "{python}"
 '''
 
@@ -544,6 +545,7 @@ validate_bridge() {{ :; }}
 validate_existing_library() {{ :; }}
 require_trusted_path() {{ :; }}
 require_trusted_file() {{ :; }}
+require_runtime_parent_access() {{ :; }}
 install() {{ command cp "$7" "$8"; command chmod "$6" "$8"; }}
 validate_python_runtime() {{ echo pip >>"{pip_log}"; }}
 python_venv_capability_checked=true
@@ -614,6 +616,7 @@ python3() {{
 }}
 require_trusted_tree() {{ echo validate >>"{trace}"; }}
 require_trusted_file() {{ :; }}
+require_runtime_parent_access() {{ :; }}
 chown() {{ :; }}
 sync() {{ :; }}
 create_new_venv "{install_root}"
@@ -713,6 +716,7 @@ def test_create_new_venv_ignores_hostile_cwd_and_pythonpath(tmp_path):
 source "{script}"
 chown() {{ :; }}
 require_trusted_tree() {{ :; }}
+require_runtime_parent_access() {{ :; }}
 sync() {{ :; }}
 create_new_venv "{install_root}"
 '''
@@ -762,6 +766,7 @@ python3() {{
 }}
 chown() {{ printf '%s\n' "$*" >>"{chown_log}"; }}
 require_trusted_tree() {{ :; }}
+require_runtime_parent_access() {{ :; }}
 sync() {{ :; }}
 create_new_venv "{install_root}"
 '''
@@ -891,6 +896,7 @@ def test_existing_venv_inaccessible_to_nonowner_fails_before_python(
 source "{script}"
 require_trusted_tree() {{ :; }}
 require_trusted_file() {{ :; }}
+require_runtime_parent_access() {{ :; }}
 {call}
 '''
     result = subprocess.run(
@@ -926,6 +932,127 @@ def test_existing_venv_complete_nonowner_model_reaches_controlled_python(
 source "{script}"
 require_trusted_tree() {{ :; }}
 require_trusted_file() {{ :; }}
+require_runtime_parent_access() {{ :; }}
+{call}
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "VENV_SENTINEL": str(sentinel)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "executed"
+
+
+def _runtime_parent_fixture(tmp_path):
+    model_root = tmp_path / "model-root"
+    intermediate = model_root / "opt"
+    install_root = intermediate / "three-device-slam"
+    venv = install_root / "venv"
+    site_packages = venv / "lib" / "python3" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (venv / "bin").mkdir()
+    python = venv / "bin" / "python"
+    python.write_text(
+        '#!/bin/bash\nprintf executed >"$VENV_SENTINEL"\n', encoding="utf-8"
+    )
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin", encoding="utf-8")
+    (site_packages / "module.py").write_text("VALUE = 1", encoding="utf-8")
+    for directory in (
+        model_root,
+        intermediate,
+        install_root,
+        venv,
+        venv / "bin",
+        venv / "lib",
+        venv / "lib" / "python3",
+        site_packages,
+    ):
+        directory.chmod(0o755)
+    python.chmod(0o755)
+    (venv / "pyvenv.cfg").chmod(0o644)
+    (site_packages / "module.py").chmod(0o644)
+    return model_root, intermediate, install_root, python
+
+
+def _root_metadata_stat_wrapper(model_root):
+    return f'''
+stat() {{
+  local target="${{@: -1}}"
+  case "$*" in
+    *%u*) printf '0\n' ;;
+    *%g*) printf '0\n' ;;
+    *%a*)
+      case "$target" in
+        "{model_root}"|"{model_root}"/*) command stat -c '%a' -- "$target" ;;
+        *) printf '755\n' ;;
+      esac
+      ;;
+    *) command stat "$@" ;;
+  esac
+}}
+'''
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX other-bit model")
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+@pytest.mark.parametrize("blocked_directory", ["install_root", "intermediate"])
+def test_runtime_parent_without_other_execute_fails_before_python_without_mutation(
+    tmp_path, script_name, blocked_directory
+):
+    model_root, intermediate, install_root, python = _runtime_parent_fixture(tmp_path)
+    blocked = install_root if blocked_directory == "install_root" else intermediate
+    blocked.chmod(0o700 if blocked_directory == "install_root" else 0o744)
+    before = _tree_snapshot(model_root)
+    sentinel = tmp_path / "sentinel"
+    script = ROOT / "scripts" / script_name
+    call = (
+        f'ensure_venv "{install_root}"\n'
+        f'validate_python_runtime "{install_root}" "{python}"'
+        if script_name == "install_ubuntu.sh"
+        else f'verify_python_runtime "{install_root}"'
+    )
+    shell = f'''
+source "{script}"
+{_root_metadata_stat_wrapper(model_root)}
+{call}
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "VENV_SENTINEL": str(sentinel)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+    assert not sentinel.exists()
+    assert _tree_snapshot(model_root) == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX other-bit model")
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+def test_runtime_parent_complete_other_execute_chain_reaches_python(
+    tmp_path, script_name
+):
+    model_root, _intermediate, install_root, python = _runtime_parent_fixture(tmp_path)
+    sentinel = tmp_path / "sentinel"
+    script = ROOT / "scripts" / script_name
+    call = (
+        f'ensure_venv "{install_root}"\n'
+        f'validate_python_runtime "{install_root}" "{python}"'
+        if script_name == "install_ubuntu.sh"
+        else f'verify_python_runtime "{install_root}"'
+    )
+    shell = f'''
+source "{script}"
+{_root_metadata_stat_wrapper(model_root)}
 {call}
 '''
     result = subprocess.run(
