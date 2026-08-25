@@ -153,18 +153,17 @@ def test_verification_fail_controls_exit_code(tmp_path, monkeypatch):
     assert cli.main(["product", "--config", str(tmp_path / "product.json")]) == 2
 
 
-@pytest.mark.parametrize(
-    ("calibration_status", "expected_exit"), [("FAIL", 2), ("BLOCKED", 3)]
-)
-def test_calibration_result_controls_final_exit_after_offline_processing(
-    tmp_path, monkeypatch, capsys, calibration_status, expected_exit
+@pytest.mark.parametrize("acquisition_status", ["PASS", "BLOCKED", "FAIL"])
+@pytest.mark.parametrize("calibration_status", ["PASS", "BLOCKED", "FAIL"])
+def test_capture_status_matrix_controls_offline_processing_and_final_exit(
+    tmp_path, monkeypatch, capsys, acquisition_status, calibration_status
 ):
     events = []
     monkeypatch.setattr(cli, "load_product_config", lambda _path: fake_config(tmp_path))
     capture = SimpleNamespace(
         session=tmp_path / "session",
         report={
-            "status": "PASS",
+            "status": acquisition_status,
             "calibration_expectations": {
                 "ego": {"status": calibration_status},
                 "left": {"status": "PASS"},
@@ -176,6 +175,17 @@ def test_calibration_result_controls_final_exit_after_offline_processing(
     monkeypatch.setattr(cli, "build_index", lambda _session: events.append("index") or {})
     monkeypatch.setattr(cli, "verify_session", lambda _session: events.append("verify") or {"status": "PASS"})
 
+    expected_offline = acquisition_status == "PASS" and calibration_status != "FAIL"
+    expected_exit = 2 if "FAIL" in (acquisition_status, calibration_status) else 3
+
     assert cli.main(["product", "--config", str(tmp_path / "product.json")]) == expected_exit
-    assert events == ["capture", "index", "verify"]
-    assert f"calibration={calibration_status}" in capsys.readouterr().out
+    assert events == (["capture", "index", "verify"] if expected_offline else ["capture"])
+    output = capsys.readouterr().out.splitlines()
+    assert f"acquisition={acquisition_status}" in output
+    assert f"calibration={calibration_status}" in output
+    assert output.index(f"acquisition={acquisition_status}") < output.index(
+        f"calibration={calibration_status}"
+    )
+    if expected_offline:
+        assert output.index(f"calibration={calibration_status}") < output.index("index=PASS")
+    assert f"overall={'FAIL' if expected_exit == 2 else 'BLOCKED'}" in output

@@ -10,6 +10,10 @@ require_tools() {
   done
 }
 
+require_verifier_tools() {
+  require_tools sha256sum awk file grep nm stat readlink find sort id
+}
+
 require_trusted_path() {
   local target=$1 resolved current component owner group mode
   local -a components
@@ -35,19 +39,19 @@ require_trusted_file() {
 }
 
 require_trusted_tree() {
-  local root=$1 entry owner group mode resolved
+  local root=$1 entry owner group mode root_device entry_device
   require_trusted_path "$root"
+  root_device=$(stat -c '%d' -- "$root") || fail "FAIL/untrusted_installation"
   while IFS= read -r -d '' entry; do
+    [[ ! -L ${entry} && ( -d ${entry} || -f ${entry} ) ]] \
+      || fail "FAIL/untrusted_installation"
+    entry_device=$(stat -c '%d' -- "$entry") || fail "FAIL/untrusted_installation"
+    [[ ${entry_device} == "${root_device}" ]] || fail "FAIL/untrusted_installation"
     owner=$(stat -c '%u' -- "$entry") || fail "FAIL/untrusted_installation"
     group=$(stat -c '%g' -- "$entry") || fail "FAIL/untrusted_installation"
     [[ ${owner} == 0 && ${group} == 0 ]] || fail "FAIL/untrusted_installation"
-    if [[ -L ${entry} ]]; then
-      resolved=$(readlink -f -- "$entry") || fail "FAIL/untrusted_installation"
-      require_trusted_path "$resolved"
-    else
-      mode=$(stat -c '%a' -- "$entry") || fail "FAIL/untrusted_installation"
-      (( (8#${mode} & 8#022) == 0 )) || fail "FAIL/untrusted_installation"
-    fi
+    mode=$(stat -c '%a' -- "$entry") || fail "FAIL/untrusted_installation"
+    (( (8#${mode} & 8#022) == 0 )) || fail "FAIL/untrusted_installation"
   done < <(find "$root" -xdev -print0)
 }
 
@@ -77,12 +81,14 @@ main() {
   # shellcheck source=/etc/os-release
   source /etc/os-release
   [[ ${ID} == ubuntu && ${VERSION_ID} == 22.04 ]] || fail "FAIL/unsupported_ubuntu"
+  require_verifier_tools
   [[ -r /opt/ros/humble/setup.bash ]] || fail "FAIL/ros_humble_missing"
   # shellcheck source=/opt/ros/humble/setup.bash
   source /opt/ros/humble/setup.bash
   [[ ${ROS_DISTRO:-} == humble ]] || fail "FAIL/ros_humble_missing"
   export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-  require_tools sha256sum file grep nm stat readlink find sort id
+
+  require_trusted_tree /etc/three-device-slam
 
   install_root=/opt/three-device-slam
   python="${install_root}/venv/bin/python"

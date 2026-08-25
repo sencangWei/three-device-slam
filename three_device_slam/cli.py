@@ -81,9 +81,11 @@ def _run_product(config, stop_event: threading.Event) -> int:
 
     print(f"session={session}")
     print(f"acquisition={acquisition_status}")
-    if acquisition_status != "PASS":
-        print(f"overall={acquisition_status}")
-        return EXIT_CODES[acquisition_status]
+    print(f"calibration={calibration_status}")
+    capture_status = _combine_status(acquisition_status, calibration_status)
+    if acquisition_status != "PASS" or calibration_status == "FAIL":
+        print(f"overall={capture_status}")
+        return EXIT_CODES[capture_status]
 
     try:
         build_index(session)
@@ -102,10 +104,7 @@ def _run_product(config, stop_event: threading.Event) -> int:
         _error("FAIL/verification_exception")
         return EXIT_CODES["FAIL"]
     print(f"verification={verification_status}")
-    print(f"calibration={calibration_status}")
-    overall = max(
-        (overall, calibration_status), key={"PASS": 0, "BLOCKED": 1, "FAIL": 2}.get
-    )
+    overall = _combine_status(overall, capture_status)
     print(f"overall={overall}")
     return EXIT_CODES[overall]
 
@@ -130,6 +129,10 @@ def _calibration_status(report) -> str:
         if not isinstance(item, dict) or item.get("status") not in EXIT_CODES:
             return "FAIL"
         statuses.append(item["status"])
+    return max(statuses, key={"PASS": 0, "BLOCKED": 1, "FAIL": 2}.get)
+
+
+def _combine_status(*statuses: str) -> str:
     return max(statuses, key={"PASS": 0, "BLOCKED": 1, "FAIL": 2}.get)
 
 

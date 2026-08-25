@@ -1,6 +1,8 @@
 import os
+import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -73,22 +75,26 @@ def test_installer_has_frozen_platform_and_bridge_checks_without_product_config(
     assert "FAIL/tool_missing:" in text
     assert "ubuntu" in text and "22.04" in text and "humble" in text
     assert "BLOCKED/2uq2_vendor_sdk_missing" in text
+    assert 'VENDOR_SDK="$vendor_sdk" CC=cc RM=rm' in text
     assert "--system-site-packages" in text
     assert 'pip install "$repo_root"' in text
     assert "libtwo_uq2_xu.so" in text
     for symbol in ("ylx_open", "ylx_read_imu27", "ylx_close"):
         assert symbol in text
-    assert "built_hash=$(sha256sum" in text
+    assert "prepared_bridge_hash=$(sha256sum" in text
     assert 'validate_bridge "${temporary_lib}/libtwo_uq2_xu.so"' in text
     assert 'require_trusted_tree "${install_root}/venv"' in text
     assert "umask 0022" in text
-    assert 'built_hash=$(sha256sum "${temporary_lib}/libtwo_uq2_xu.so"' in text
+    assert 'prepared_bridge_hash=$(sha256sum "${temporary_lib}/libtwo_uq2_xu.so"' in text
     assert "installed_hash=$(sha256sum" in text
     assert "${bridge}.sha256" in text
     assert 'mktemp -d "${install_root}/.lib.' in text
     assert 'mv -T --no-clobber "$temporary_lib" "$lib"' in text
     assert 'ensure_root_directory "$install_root"' in text
+    assert "ensure_root_directory /run/three-device-slam" in text
+    assert "acquire_install_lock /run/three-device-slam/install.lock" in text
     assert "ensure_root_directory /etc/three-device-slam" in text
+    assert "require_trusted_tree /etc/three-device-slam" in text
     assert 'install -d -o root -g root -m 0755 "$target"' in text
     assert "ensure_session_directory /var/lib/three-device-slam/sessions" in text
     assert 'install -d -o robot -g robot -m 0750 "$target"' in text
@@ -110,6 +116,7 @@ def test_environment_verifier_is_read_only_and_checks_frozen_invariants():
     assert 'validate_bridge_manifest "$bridge" "$manifest" "$bridge"' in text
     assert "FAIL/untrusted_installation" in text
     assert 'require_trusted_tree "$install_root"' in text
+    assert "require_trusted_tree /etc/three-device-slam" in text
     assert "FAIL/tool_missing:" in text
     for write_command in ("install ", "mkdir ", "touch ", "rm ", "mv ", "cp "):
         assert write_command not in text
@@ -130,6 +137,48 @@ def test_missing_tool_has_stable_classification(script):
     assert result.stderr.strip() == "FAIL/tool_missing:definitely_missing_tool"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX PATH behavior")
+@pytest.mark.parametrize(
+    ("script_name", "preflight", "missing_tools"),
+    [
+        ("install_ubuntu.sh", "require_installer_tools", ("awk", "cc", "mkdir", "rm")),
+        ("verify_ubuntu_environment.sh", "require_verifier_tools", ("awk",)),
+    ],
+)
+def test_real_script_preflight_classifies_each_missing_tool(
+    tmp_path, script_name, preflight, missing_tools
+):
+    required = {
+        "install_ubuntu.sh": (
+            "python3", "dirname", "install", "make", "sha256sum", "awk", "file",
+            "grep", "nm", "stat", "readlink", "chmod", "mktemp", "mv", "rm",
+            "sync", "find", "sort", "id", "cc", "mkdir", "flock",
+        ),
+        "verify_ubuntu_environment.sh": (
+            "sha256sum", "awk", "file", "grep", "nm", "stat", "readlink", "find",
+            "sort", "id",
+        ),
+    }[script_name]
+    script = ROOT / "scripts" / script_name
+
+    for missing in missing_tools:
+        tool_dir = tmp_path / missing
+        tool_dir.mkdir()
+        for tool in required:
+            if tool != missing:
+                resolved = shutil.which(tool)
+                assert resolved, tool
+                (tool_dir / tool).symlink_to(resolved)
+        result = subprocess.run(
+            ["/bin/bash", "-c", f'source "{script}"; {preflight}'],
+            env={**os.environ, "PATH": str(tool_dir)},
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2
+        assert result.stderr.strip() == f"FAIL/tool_missing:{missing}"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership invariant")
 def test_trust_check_rejects_non_root_owned_path(tmp_path):
     path = ROOT / "scripts" / "install_ubuntu.sh"
@@ -138,6 +187,81 @@ def test_trust_check_rejects_non_root_owned_path(tmp_path):
         capture_output=True,
         text=True,
     )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX tree types")
+@pytest.mark.parametrize("script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"])
+def test_trusted_tree_rejects_symlink_and_special_file(tmp_path, script_name):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "safe").write_text("safe", encoding="utf-8")
+    script = ROOT / "scripts" / script_name
+    fake_stat = '''
+stat() {
+  case "$*" in
+    *%u*) echo 0 ;;
+    *%g*) echo 0 ;;
+    *%a*) echo 755 ;;
+    *%d*) echo 1 ;;
+    *) command stat "$@" ;;
+  esac
+}
+'''
+
+    safe = subprocess.run(
+        ["/bin/bash", "-c", f'source "{script}"; {fake_stat} require_trusted_tree "{tree}"'],
+        capture_output=True,
+        text=True,
+    )
+    assert safe.returncode == 0, safe.stderr
+
+    (tree / "link").symlink_to(tree / "safe")
+    linked = subprocess.run(
+        ["/bin/bash", "-c", f'source "{script}"; {fake_stat} require_trusted_tree "{tree}"'],
+        capture_output=True,
+        text=True,
+    )
+    assert linked.returncode == 2
+    (tree / "link").unlink()
+
+    os.mkfifo(tree / "special")
+    special = subprocess.run(
+        ["/bin/bash", "-c", f'source "{script}"; {fake_stat} require_trusted_tree "{tree}"'],
+        capture_output=True,
+        text=True,
+    )
+    assert special.returncode == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX tree metadata")
+@pytest.mark.parametrize("unsafe_field", ["mode", "device"])
+def test_trusted_tree_rejects_writable_or_cross_filesystem_entry(tmp_path, unsafe_field):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    unsafe = tree / "unsafe"
+    unsafe.write_text("unsafe", encoding="utf-8")
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    unsafe_mode = "775" if unsafe_field == "mode" else "755"
+    unsafe_device = "2" if unsafe_field == "device" else "1"
+    shell = f'''
+source "{script}"
+stat() {{
+  case "$*" in
+    *%u*) echo 0 ;;
+    *%g*) echo 0 ;;
+    *%a*unsafe*) echo {unsafe_mode} ;;
+    *%a*) echo 755 ;;
+    *%d*unsafe*) echo {unsafe_device} ;;
+    *%d*) echo 1 ;;
+    *) command stat "$@" ;;
+  esac
+}}
+require_trusted_tree "{tree}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
 
     assert result.returncode == 2
     assert result.stderr.strip() == "FAIL/untrusted_installation"
@@ -274,3 +398,94 @@ validate_python_runtime "{install_root}" "{python}"
 
     assert result.returncode == 0, result.stderr
     assert trace.read_text(encoding="utf-8").splitlines() == ["tree", "file", "execute"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX venv layout")
+def test_fresh_cpython_venv_is_normalized_before_strict_tree_validation(tmp_path):
+    install_root = tmp_path / "install"
+    venv = install_root / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--copies", "--without-pip", str(venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lib64 = venv / "lib64"
+    if not lib64.is_symlink():
+        pytest.skip("interpreter does not generate the 64-bit lib64 venv link")
+    assert os.readlink(lib64) == "lib"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    fake_stat = '''
+stat() {
+  case "$*" in
+    *%u*) echo 0 ;;
+    *%g*) echo 0 ;;
+    *%a*) echo 755 ;;
+    *%d*) echo 1 ;;
+    *) command stat "$@" ;;
+  esac
+}
+'''
+    shell = f'''
+source "{script}"
+normalize_venv_layout "{install_root}"
+{fake_stat}
+require_trusted_tree "{venv}"
+'''
+
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert not lib64.exists() and not lib64.is_symlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_install_lock_contention_has_stable_failure(tmp_path):
+    lock = tmp_path / "install.lock"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+require_trusted_file() {{ :; }}
+flock() {{ return 1; }}
+acquire_install_lock "{lock}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/install_in_progress"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_bridge_conflict_precedes_pip_and_preserves_venv(tmp_path):
+    install_root = tmp_path / "install"
+    lib = install_root / "lib"
+    python = install_root / "venv" / "bin" / "python"
+    lib.mkdir(parents=True)
+    python.parent.mkdir(parents=True)
+    sentinel = b"venv-sentinel"
+    python.write_bytes(sentinel)
+    python.chmod(0o755)
+    before_mtime = python.stat().st_mtime_ns
+    (lib / "libtwo_uq2_xu.so").write_bytes(b"existing")
+    artifact = tmp_path / "artifact.so"
+    artifact.write_bytes(b"different")
+    pip_log = tmp_path / "pip.log"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+validate_bridge() {{ :; }}
+validate_existing_library() {{ :; }}
+require_trusted_path() {{ :; }}
+require_trusted_file() {{ :; }}
+install() {{ command cp "$7" "$8"; command chmod "$6" "$8"; }}
+validate_python_runtime() {{ echo pip >>"{pip_log}"; }}
+install_runtime "{artifact}" "{install_root}" "{ROOT}"
+'''
+
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/xu_bridge_conflict"
+    assert not pip_log.exists()
+    assert python.read_bytes() == sentinel
+    assert python.stat().st_mtime_ns == before_mtime
