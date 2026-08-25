@@ -72,6 +72,7 @@ def test_frozen_sources_are_explicit():
 def test_source_map_has_unique_targets():
     payload = json.loads(PROVENANCE.read_text(encoding="utf-8"))
     targets = [row["target"] for row in payload["files"]]
+    assert len(targets) == 22
     assert len(targets) == len(set(targets))
 
 
