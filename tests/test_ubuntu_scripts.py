@@ -267,6 +267,63 @@ require_trusted_tree "{tree}"
     assert result.stderr.strip() == "FAIL/untrusted_installation"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bash coprocess behavior")
+@pytest.mark.parametrize("script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"])
+def test_trusted_tree_propagates_find_failure_after_partial_nul_output(tmp_path, script_name):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    safe = tree / "safe"
+    safe.write_text("safe", encoding="utf-8")
+    script = ROOT / "scripts" / script_name
+    shell = f'''
+source "{script}"
+stat() {{
+  case "$*" in
+    *%u*|*%g*) echo 0 ;;
+    *%a*) echo 755 ;;
+    *%d*) echo 1 ;;
+    *) command stat "$@" ;;
+  esac
+}}
+find() {{ printf '%s\\0%s\\0' "{tree}" "{safe}"; return 1; }}
+require_trusted_tree "{tree}"
+'''
+    before = set(tmp_path.iterdir())
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+    assert set(tmp_path.iterdir()) == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash coprocess behavior")
+def test_trusted_tree_stops_and_reaps_find_when_entry_validation_fails(tmp_path):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    special = tree / "special"
+    os.mkfifo(special)
+    script = ROOT / "scripts" / "verify_ubuntu_environment.sh"
+    shell = f'''
+source "{script}"
+stat() {{
+  case "$*" in
+    *%u*|*%g*) echo 0 ;;
+    *%a*) echo 755 ;;
+    *%d*) echo 1 ;;
+    *) command stat "$@" ;;
+  esac
+}}
+find() {{ printf '%s\\0%s\\0' "{tree}" "{special}"; while :; do :; done; }}
+require_trusted_tree "{tree}"
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell], capture_output=True, text=True, timeout=3
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+
+
 def test_invalid_bridge_artifact_does_not_replace_existing_library(tmp_path):
     install_root = tmp_path / "install"
     lib = install_root / "lib"
@@ -479,6 +536,7 @@ require_trusted_path() {{ :; }}
 require_trusted_file() {{ :; }}
 install() {{ command cp "$7" "$8"; command chmod "$6" "$8"; }}
 validate_python_runtime() {{ echo pip >>"{pip_log}"; }}
+python_venv_capability_checked=true
 install_runtime "{artifact}" "{install_root}" "{ROOT}"
 '''
 
@@ -489,3 +547,116 @@ install_runtime "{artifact}" "{install_root}" "{ROOT}"
     assert not pip_log.exists()
     assert python.read_bytes() == sentinel
     assert python.stat().st_mtime_ns == before_mtime
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_missing_python_venv_capability_precedes_install_tree_mutation(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"artifact")
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{ return 1; }}
+prepare_bridge() {{ mkdir "{install_root}/mutated"; }}
+install_runtime "{artifact}" "{install_root}" "{ROOT}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/tool_missing:python3-venv"
+    assert list(install_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_failed_new_venv_creation_leaves_no_final_or_owned_temp(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{ return 1; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert not (install_root / "venv").exists()
+    assert list(install_root.glob(".venv.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_new_venv_is_first_published_by_rename_after_validation(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    trace = tmp_path / "trace"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{
+  local target="${{@: -1}}"
+  mkdir -p "$target/bin"
+  printf '#!/bin/bash\n' >"$target/bin/python"
+  chmod 0755 "$target/bin/python"
+}}
+require_trusted_tree() {{ echo validate >>"{trace}"; }}
+require_trusted_file() {{ :; }}
+sync() {{ :; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert (install_root / "venv" / "bin" / "python").is_file()
+    assert trace.read_text(encoding="utf-8").splitlines() == ["validate", "validate"]
+    assert list(install_root.glob(".venv.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_existing_venv_is_not_rebuilt_or_republished(tmp_path):
+    install_root = tmp_path / "install"
+    python = install_root / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"sentinel")
+    before = (python.read_bytes(), python.stat().st_mtime_ns)
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{ echo rebuilt >&2; return 1; }}
+normalize_venv_layout() {{ :; }}
+ensure_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert (python.read_bytes(), python.stat().st_mtime_ns) == before
+    assert list(install_root.glob(".venv.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash inode behavior")
+def test_replaced_temporary_venv_is_neither_published_nor_deleted(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{
+  local target="${{@: -1}}"
+  mkdir "${{target}}.replacement"
+  printf replacement >"${{target}}.replacement/marker"
+  rm -rf -- "$target"
+  mv "${{target}}.replacement" "$target"
+}}
+require_trusted_tree() {{ :; }}
+sync() {{ :; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    replacements = list(install_root.glob(".venv.*.tmp"))
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+    assert not (install_root / "venv").exists()
+    assert len(replacements) == 1
+    assert (replacements[0] / "marker").read_text(encoding="utf-8") == "replacement"

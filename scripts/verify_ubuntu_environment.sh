@@ -38,21 +38,44 @@ require_trusted_file() {
   require_trusted_path "$1"
 }
 
+_trusted_tree_entry() {
+  local entry=$1 root_device=$2 owner group mode entry_device
+  [[ ! -L ${entry} && ( -d ${entry} || -f ${entry} ) ]] || return 1
+  entry_device=$(stat -c '%d' -- "$entry") || return 1
+  [[ ${entry_device} == "${root_device}" ]] || return 1
+  owner=$(stat -c '%u' -- "$entry") || return 1
+  group=$(stat -c '%g' -- "$entry") || return 1
+  [[ ${owner} == 0 && ${group} == 0 ]] || return 1
+  mode=$(stat -c '%a' -- "$entry") || return 1
+  (( (8#${mode} & 8#022) == 0 ))
+}
+
 require_trusted_tree() {
-  local root=$1 entry owner group mode root_device entry_device
+  local root=$1 root_device entry find_pid find_fd control_fd invalid=false
   require_trusted_path "$root"
   root_device=$(stat -c '%d' -- "$root") || fail "FAIL/untrusted_installation"
-  while IFS= read -r -d '' entry; do
-    [[ ! -L ${entry} && ( -d ${entry} || -f ${entry} ) ]] \
-      || fail "FAIL/untrusted_installation"
-    entry_device=$(stat -c '%d' -- "$entry") || fail "FAIL/untrusted_installation"
-    [[ ${entry_device} == "${root_device}" ]] || fail "FAIL/untrusted_installation"
-    owner=$(stat -c '%u' -- "$entry") || fail "FAIL/untrusted_installation"
-    group=$(stat -c '%g' -- "$entry") || fail "FAIL/untrusted_installation"
-    [[ ${owner} == 0 && ${group} == 0 ]] || fail "FAIL/untrusted_installation"
-    mode=$(stat -c '%a' -- "$entry") || fail "FAIL/untrusted_installation"
-    (( (8#${mode} & 8#022) == 0 )) || fail "FAIL/untrusted_installation"
-  done < <(find "$root" -xdev -print0)
+  coproc TRUSTED_TREE_FIND {
+    IFS= read -r _
+    find "$root" -xdev -print0 2>/dev/null
+  }
+  find_pid=$TRUSTED_TREE_FIND_PID
+  exec {find_fd}<&"${TRUSTED_TREE_FIND[0]}"
+  control_fd=${TRUSTED_TREE_FIND[1]}
+  printf 'start\n' >&"$control_fd"
+  exec {control_fd}>&-
+  while IFS= read -r -d '' -u "$find_fd" entry; do
+    if ! _trusted_tree_entry "$entry" "$root_device"; then
+      invalid=true
+      break
+    fi
+  done
+  exec {find_fd}<&-
+  if [[ ${invalid} == true ]]; then
+    kill "$find_pid" 2>/dev/null || true
+    wait "$find_pid" 2>/dev/null || true
+    fail "FAIL/untrusted_installation"
+  fi
+  wait "$find_pid" || fail "FAIL/untrusted_installation"
 }
 
 validate_bridge() {

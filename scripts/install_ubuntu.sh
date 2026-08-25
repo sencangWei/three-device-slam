@@ -39,31 +39,54 @@ require_trusted_file() {
   require_trusted_path "$1"
 }
 
+_trusted_tree_entry() {
+  local entry=$1 root_device=$2 allowed_link=$3 owner group mode entry_device link_target
+  if [[ -L ${entry} ]]; then
+    [[ -n ${allowed_link} && ${entry} == "${allowed_link}" ]] || return 1
+    link_target=$(readlink -- "$entry") || return 1
+    [[ ${link_target} == lib ]] || return 1
+  else
+    [[ -d ${entry} || -f ${entry} ]] || return 1
+  fi
+  entry_device=$(stat -c '%d' -- "$entry") || return 1
+  [[ ${entry_device} == "${root_device}" ]] || return 1
+  owner=$(stat -c '%u' -- "$entry") || return 1
+  group=$(stat -c '%g' -- "$entry") || return 1
+  [[ ${owner} == 0 && ${group} == 0 ]] || return 1
+  if [[ -L ${entry} ]]; then
+    (require_trusted_path "${entry%/lib64}/lib") >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  mode=$(stat -c '%a' -- "$entry") || return 1
+  (( (8#${mode} & 8#022) == 0 ))
+}
+
 require_trusted_tree() {
-  local root=$1 allowed_link=${2:-} entry owner group mode root_device entry_device link_target
+  local root=$1 allowed_link=${2:-} root_device entry find_pid find_fd control_fd invalid=false
   require_trusted_path "$root"
   root_device=$(stat -c '%d' -- "$root") || fail "FAIL/untrusted_installation"
-  while IFS= read -r -d '' entry; do
-    if [[ -L ${entry} ]]; then
-      [[ -n ${allowed_link} && ${entry} == "${allowed_link}" ]] \
-        || fail "FAIL/untrusted_installation"
-      link_target=$(readlink -- "$entry") || fail "FAIL/untrusted_installation"
-      [[ ${link_target} == lib ]] || fail "FAIL/untrusted_installation"
-    else
-      [[ -d ${entry} || -f ${entry} ]] || fail "FAIL/untrusted_installation"
+  coproc TRUSTED_TREE_FIND {
+    IFS= read -r _
+    find "$root" -xdev -print0 2>/dev/null
+  }
+  find_pid=$TRUSTED_TREE_FIND_PID
+  exec {find_fd}<&"${TRUSTED_TREE_FIND[0]}"
+  control_fd=${TRUSTED_TREE_FIND[1]}
+  printf 'start\n' >&"$control_fd"
+  exec {control_fd}>&-
+  while IFS= read -r -d '' -u "$find_fd" entry; do
+    if ! _trusted_tree_entry "$entry" "$root_device" "$allowed_link"; then
+      invalid=true
+      break
     fi
-    entry_device=$(stat -c '%d' -- "$entry") || fail "FAIL/untrusted_installation"
-    [[ ${entry_device} == "${root_device}" ]] || fail "FAIL/untrusted_installation"
-    owner=$(stat -c '%u' -- "$entry") || fail "FAIL/untrusted_installation"
-    group=$(stat -c '%g' -- "$entry") || fail "FAIL/untrusted_installation"
-    [[ ${owner} == 0 && ${group} == 0 ]] || fail "FAIL/untrusted_installation"
-    if [[ -L ${entry} ]]; then
-      require_trusted_path "${entry%/lib64}/lib"
-      continue
-    fi
-    mode=$(stat -c '%a' -- "$entry") || fail "FAIL/untrusted_installation"
-    (( (8#${mode} & 8#022) == 0 )) || fail "FAIL/untrusted_installation"
-  done < <(find "$root" -xdev -print0)
+  done
+  exec {find_fd}<&-
+  if [[ ${invalid} == true ]]; then
+    kill "$find_pid" 2>/dev/null || true
+    wait "$find_pid" 2>/dev/null || true
+    fail "FAIL/untrusted_installation"
+  fi
+  wait "$find_pid" || fail "FAIL/untrusted_installation"
 }
 
 ensure_root_directory() {
@@ -137,12 +160,107 @@ validate_python_runtime() {
   "$python" -I -B -m pip --version >/dev/null 2>&1 || fail "FAIL/tool_missing:pip"
 }
 
-normalize_venv_layout() {
-  local install_root=$1 lib64="${1}/venv/lib64" target
+normalize_venv_path() {
+  local venv=$1 lib64="${1}/lib64" target
   if [[ -L ${lib64} ]]; then
     target=$(readlink -- "$lib64") || fail "FAIL/untrusted_installation"
     [[ ${target} == lib ]] || fail "FAIL/untrusted_installation"
     rm -- "$lib64"
+  fi
+  return 0
+}
+
+normalize_venv_layout() { normalize_venv_path "${1}/venv"; }
+
+python_venv_capability_checked=false
+probe_python_venv() {
+  python3 -I -B -c 'import venv, ensurepip' >/dev/null 2>&1 \
+    || fail "FAIL/tool_missing:python3-venv"
+  python_venv_capability_checked=true
+}
+
+temporary_venv=
+temporary_venv_parent=
+temporary_venv_identity=
+temporary_venv_is_original() {
+  local resolved identity
+  if [[ -z ${temporary_venv} || -z ${temporary_venv_parent} \
+      || -z ${temporary_venv_identity} || ! -d ${temporary_venv} \
+      || -L ${temporary_venv} ]]; then
+    return 1
+  fi
+  resolved=$(readlink -f -- "$temporary_venv") || return 1
+  [[ ${resolved} == "${temporary_venv}" ]] || return 1
+  case ${resolved} in
+    "${temporary_venv_parent}"/.venv.*.tmp) ;;
+    *) return 1 ;;
+  esac
+  identity=$(stat -c '%d:%i' -- "$resolved") || return 1
+  [[ ${identity} == "${temporary_venv_identity}" ]]
+}
+
+cleanup_temporary_venv() {
+  temporary_venv_is_original || return 0
+  rm -rf -- "$temporary_venv"
+  temporary_venv=
+  temporary_venv_parent=
+  temporary_venv_identity=
+}
+
+create_new_venv() {
+  local install_root=$1 final_venv="${1}/venv"
+  temporary_venv_parent=$(readlink -f -- "$install_root") \
+    || fail "FAIL/untrusted_installation"
+  temporary_venv=$(mktemp -d "${install_root}/.venv.XXXXXXXX.tmp")
+  temporary_venv=$(readlink -f -- "$temporary_venv") \
+    || fail "FAIL/untrusted_installation"
+  temporary_venv_identity=$(stat -c '%d:%i' -- "$temporary_venv") \
+    || fail "FAIL/untrusted_installation"
+  if ! python3 -m venv --copies --system-site-packages "$temporary_venv"; then
+    cleanup_temporary_venv
+    fail "FAIL/venv_creation"
+  fi
+  if ! temporary_venv_is_original; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  chmod -R go-w "$temporary_venv"
+  normalize_venv_path "$temporary_venv"
+  if ! (require_trusted_tree "$temporary_venv") 2>/dev/null; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  sync -f "$temporary_venv"
+  if ! temporary_venv_is_original; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  [[ ! -e ${final_venv} && ! -L ${final_venv} ]] || {
+    cleanup_temporary_venv
+    fail "FAIL/venv_publish_conflict"
+  }
+  if ! mv -T --no-clobber "$temporary_venv" "$final_venv"; then
+    cleanup_temporary_venv
+    fail "FAIL/venv_publish_conflict"
+  fi
+  if [[ -e ${temporary_venv} || -L ${temporary_venv} ]]; then
+    cleanup_temporary_venv
+    fail "FAIL/venv_publish_conflict"
+  fi
+  temporary_venv=
+  temporary_venv_parent=
+  temporary_venv_identity=
+  sync -f "$install_root"
+  require_trusted_tree "$final_venv"
+}
+
+ensure_venv() {
+  local install_root=$1 venv="${1}/venv"
+  if [[ -e ${venv} || -L ${venv} ]]; then
+    [[ -d ${venv} && ! -L ${venv} ]] || fail "FAIL/untrusted_installation"
+    normalize_venv_layout "$install_root"
+  else
+    create_new_venv "$install_root"
   fi
 }
 
@@ -167,6 +285,11 @@ cleanup_temporary_lib() {
       "${temporary_lib_parent}"/.lib.*.tmp) rm -rf -- "$temporary_lib" ;;
     esac
   fi
+}
+
+cleanup_install_temporary_paths() {
+  cleanup_temporary_lib
+  cleanup_temporary_venv
 }
 
 prepare_bridge() {
@@ -242,16 +365,10 @@ publish_bridge() {
 
 install_runtime() {
   local artifact=$1 install_root=$2 repo_root=$3 python
+  [[ ${python_venv_capability_checked} == true ]] || probe_python_venv
   prepare_bridge "$artifact" "$install_root"
   python="${install_root}/venv/bin/python"
-  if [[ -e ${install_root}/venv || -L ${install_root}/venv ]]; then
-    [[ -d ${install_root}/venv && ! -L ${install_root}/venv ]] \
-      || fail "FAIL/untrusted_installation"
-  else
-    python3 -m venv --copies --system-site-packages "${install_root}/venv"
-    chmod -R go-w "${install_root}/venv"
-  fi
-  normalize_venv_layout "$install_root"
+  ensure_venv "$install_root"
   validate_python_runtime "$install_root" "$python"
   "$python" -I -B -m pip install "$repo_root"
   chmod -R go-w "${install_root}/venv"
@@ -272,6 +389,7 @@ main() {
   source /etc/os-release
   [[ ${ID} == ubuntu && ${VERSION_ID} == 22.04 ]] || fail "FAIL/unsupported_ubuntu"
   require_installer_tools
+  probe_python_venv
   [[ -r /opt/ros/humble/setup.bash ]] || fail "FAIL/ros_humble_missing"
   # shellcheck source=/opt/ros/humble/setup.bash
   source /opt/ros/humble/setup.bash
@@ -295,7 +413,7 @@ main() {
   MAKEFLAGS= make -C "$repo_root/native/2uq2_xu_bridge" clean all \
     VENDOR_SDK="$vendor_sdk" CC=cc RM=rm
   artifact="$repo_root/native/2uq2_xu_bridge/build/libtwo_uq2_xu.so"
-  trap cleanup_temporary_lib EXIT
+  trap cleanup_install_temporary_paths EXIT
   install_runtime "$artifact" "$install_root" "$repo_root"
 }
 
