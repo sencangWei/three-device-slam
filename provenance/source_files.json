@@ -1,8 +1,8 @@
 {
   "schema": "three-device-slam.source-provenance.v1",
   "sources": {
-    "d405_product_main": {"url": "https://github.com/sencangWei/D405-MAXIMU.git", "commit": "a7a143df9a138ada481e6c234b03803ab0cae837"},
-    "three_device_migration": {"url": "https://github.com/sencangWei/D405-MAXIMU.git", "commit": "de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78"}
+    "d405_product_main": {"url": "https://github.com/sencangWei/D405-MAXIMU.git", "commit": "a7a143df9a138ada481e6c234b03803ab0cae837", "remote_commit_reachable_at_extraction": true},
+    "three_device_migration": {"url": "https://github.com/sencangWei/D405-MAXIMU.git", "commit": "de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78", "remote_commit_reachable_at_extraction": false, "local_snapshot_archive_sha256": "b4e8d32e5d879be73268439fe52c964df1c43a4f205a1dcf0f70dc9afb4c1d9a"}
   },
   "files": [
     {"source_name":"three_device_migration","source_path":"ego_vio/multidevice/model.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/core/model.py","license_review":"repository_license"},
@@ -18,10 +18,12 @@
     {"source_name":"d405_product_main","source_path":"ego_vio/imu/calibration.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/imu/calibration.py","license_review":"repository_license"},
     {"source_name":"d405_product_main","source_path":"ego_vio/gripper/manual_gripper.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/gripper/manual_gripper.py","license_review":"repository_license"},
     {"source_name":"d405_product_main","source_path":"ego_vio/gripper/training_sync.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/gripper/training_sync.py","license_review":"repository_license"},
-    {"source_name":"d405_product_main","source_path":"ego_vio/imu/imu_reader.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/imu/imu_reader.py","license_review":"repository_license"},
-    {"source_name":"d405_product_main","source_path":"ego_vio/imu/stream_protocol.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/imu/stream_protocol.py","license_review":"repository_license"},
-    {"source_name":"d405_product_main","source_path":"ego_vio/recorder/recorder.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/recorder/recorder.py","license_review":"repository_license"},
-    {"source_name":"d405_product_main","source_path":"scripts/capture_d405_720p_rgb_stereo_ir.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/worker.py","license_review":"repository_license"},
+    {"source_name":"three_device_migration","source_path":"ego_vio/imu/imu_reader.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/devices/d405_umi/imu/imu_reader.py","license_review":"repository_license"},
+    {"source_name":"three_device_migration","source_path":"ego_vio/imu/stream_protocol.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/devices/d405_umi/imu/stream_protocol.py","license_review":"repository_license"},
+    {"source_name":"three_device_migration","source_path":"ego_vio/recorder/recorder.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/devices/d405_umi/recorder/recorder.py","license_review":"repository_license"},
+    {"source_name":"three_device_migration","source_path":"scripts/capture_d405_720p_rgb_stereo_ir.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/devices/d405_umi/worker.py","license_review":"repository_license"},
+    {"source_name":"d405_product_main","source_path":"ego_vio/timing.py","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/timing.py","license_review":"repository_license"},
+    {"source_name":"d405_product_main","source_path":"config/gripper/umi_manual_gripper_20260824.yaml","source_commit":"a7a143df9a138ada481e6c234b03803ab0cae837","target":"three_device_slam/devices/d405_umi/gripper/umi_manual_gripper_20260824.yaml","license_review":"repository_license"},
     {"source_name":"three_device_migration","source_path":"scripts/capture_three_devices.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/acquisition/coordinator.py","license_review":"repository_license"},
     {"source_name":"three_device_migration","source_path":"scripts/build_three_device_index.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/synchronization/build_index.py","license_review":"repository_license"},
     {"source_name":"three_device_migration","source_path":"scripts/verify_three_device_session.py","source_commit":"de2b52f40b493d0f5ee63bbeca8d4afcb1a8cb78","target":"three_device_slam/quality/verify_session.py","license_review":"repository_license"}
