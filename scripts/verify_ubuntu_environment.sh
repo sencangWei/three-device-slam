@@ -97,8 +97,80 @@ validate_bridge_manifest() {
     || fail "FAIL/xu_bridge_hash"
 }
 
+_venv_runtime_entry_accessible() {
+  local entry=$1 expected_type=$2 required_bits=$3 resolved mode
+  if [[ -L ${entry} ]]; then
+    resolved=$(readlink -f -- "$entry") || return 1
+    (require_trusted_path "$resolved") >/dev/null 2>&1 || return 1
+    entry=$resolved
+  fi
+  case ${expected_type} in
+    directory) [[ -d ${entry} ]] || return 1 ;;
+    regular) [[ -f ${entry} ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  mode=$(stat -c '%a' -- "$entry") || return 1
+  (( (8#${mode} & 8#${required_bits}) == 8#${required_bits} ))
+}
+
+_venv_runtime_library_entry_accessible() {
+  local entry=$1
+  if [[ -d ${entry} ]]; then
+    _venv_runtime_entry_accessible "$entry" directory 005
+  elif [[ -f ${entry} ]]; then
+    _venv_runtime_entry_accessible "$entry" regular 004
+  else
+    return 1
+  fi
+}
+
+require_venv_runtime_access() {
+  local venv=$1 entry find_pid find_fd control_fd invalid=false
+  _venv_runtime_entry_accessible "$venv" directory 005 \
+    || fail "FAIL/untrusted_installation"
+  _venv_runtime_entry_accessible "${venv}/bin" directory 005 \
+    || fail "FAIL/untrusted_installation"
+  _venv_runtime_entry_accessible "${venv}/lib" directory 005 \
+    || fail "FAIL/untrusted_installation"
+  _venv_runtime_entry_accessible "${venv}/pyvenv.cfg" regular 004 \
+    || fail "FAIL/untrusted_installation"
+  _venv_runtime_entry_accessible "${venv}/bin/python" regular 005 \
+    || fail "FAIL/untrusted_installation"
+
+  coproc VENV_RUNTIME_FIND {
+    IFS= read -r _
+    find "${venv}/lib" -xdev -print0 2>/dev/null
+  }
+  find_pid=$VENV_RUNTIME_FIND_PID
+  exec {find_fd}<&"${VENV_RUNTIME_FIND[0]}"
+  control_fd=${VENV_RUNTIME_FIND[1]}
+  printf 'start\n' >&"$control_fd"
+  exec {control_fd}>&-
+  while IFS= read -r -d '' -u "$find_fd" entry; do
+    if ! _venv_runtime_library_entry_accessible "$entry"; then
+      invalid=true
+      break
+    fi
+  done
+  exec {find_fd}<&-
+  if [[ ${invalid} == true ]]; then
+    kill "$find_pid" 2>/dev/null || true
+    wait "$find_pid" 2>/dev/null || true
+    fail "FAIL/untrusted_installation"
+  fi
+  wait "$find_pid" || fail "FAIL/untrusted_installation"
+}
+
+verify_python_runtime() {
+  local install_root=$1 python="${1}/venv/bin/python"
+  require_trusted_tree "${install_root}/venv"
+  require_trusted_file "$python"
+  require_venv_runtime_access "${install_root}/venv"
+  "$python" -I -B -c 'import three_device_slam' || fail "FAIL/python_package_missing"
+}
+
 main() {
-  local install_root python lib bridge manifest members robot_uid robot_gid session_root
+  local install_root lib bridge manifest members robot_uid robot_gid session_root
   export PATH=/usr/sbin:/usr/bin:/sbin:/bin
   [[ -r /etc/os-release ]] || fail "FAIL/unsupported_ubuntu"
   # shellcheck source=/etc/os-release
@@ -114,14 +186,11 @@ main() {
   require_trusted_tree /etc/three-device-slam
 
   install_root=/opt/three-device-slam
-  python="${install_root}/venv/bin/python"
   lib="${install_root}/lib"
   bridge="${lib}/libtwo_uq2_xu.so"
   manifest="${bridge}.sha256"
   require_trusted_tree "$install_root"
-  require_trusted_path "${install_root}/venv"
-  require_trusted_file "$python"
-  [[ -x ${python} ]] || fail "FAIL/untrusted_installation"
+  verify_python_runtime "$install_root"
   require_trusted_path "$lib"
   require_trusted_file "$bridge"
   require_trusted_file "$manifest"
@@ -129,7 +198,6 @@ main() {
   [[ ${members} == $'libtwo_uq2_xu.so\nlibtwo_uq2_xu.so.sha256' ]] \
     || fail "FAIL/xu_bridge_existing_invalid"
 
-  "$python" -I -B -c 'import three_device_slam' || fail "FAIL/python_package_missing"
   validate_bridge_manifest "$bridge" "$manifest" "$bridge"
   validate_bridge "$bridge"
 

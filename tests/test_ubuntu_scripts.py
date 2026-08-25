@@ -442,11 +442,17 @@ publish_bridge "{artifact}" "{install_root}"
 @pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
 def test_python_runtime_validates_full_venv_before_first_execution(tmp_path):
     install_root = tmp_path / "install"
+    site_packages = install_root / "venv" / "lib" / "python3" / "site-packages"
+    site_packages.mkdir(parents=True)
     python = install_root / "venv" / "bin" / "python"
-    python.parent.mkdir(parents=True)
+    python.parent.mkdir()
     trace = tmp_path / "trace"
     python.write_text(f'#!/bin/bash\necho execute >>"{trace}"\n', encoding="utf-8")
     python.chmod(0o755)
+    (install_root / "venv" / "pyvenv.cfg").write_text(
+        "home = /usr/bin", encoding="utf-8"
+    )
+    (site_packages / "module.py").write_text("VALUE = 1", encoding="utf-8")
     script = ROOT / "scripts" / "install_ubuntu.sh"
     shell = f'''
 source "{script}"
@@ -600,9 +606,10 @@ def test_new_venv_is_first_published_by_rename_after_validation(tmp_path):
 source "{script}"
 python3() {{
   local target="${{@: -1}}"
-  mkdir -p "$target/bin" "$target/lib"
+  mkdir -p "$target/bin" "$target/lib/python3/site-packages"
   printf '#!/bin/bash\n' >"$target/bin/python"
   printf home >"$target/pyvenv.cfg"
+  printf module >"$target/lib/python3/site-packages/module.py"
   chmod 0755 "$target/bin/python"
 }}
 require_trusted_tree() {{ echo validate >>"{trace}"; }}
@@ -628,19 +635,23 @@ def test_existing_venv_is_not_rebuilt_or_republished(tmp_path):
     install_root = tmp_path / "install"
     python = install_root / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
+    (install_root / "venv" / "lib").mkdir()
+    lib64 = install_root / "venv" / "lib64"
+    lib64.symlink_to("lib", target_is_directory=True)
     python.write_bytes(b"sentinel")
     before = (python.read_bytes(), python.stat().st_mtime_ns)
     script = ROOT / "scripts" / "install_ubuntu.sh"
     shell = f'''
 source "{script}"
 python3() {{ echo rebuilt >&2; return 1; }}
-normalize_venv_layout() {{ :; }}
 ensure_venv "{install_root}"
 '''
     result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
     assert (python.read_bytes(), python.stat().st_mtime_ns) == before
+    assert lib64.is_symlink()
+    assert os.readlink(lib64) == "lib"
     assert list(install_root.glob(".venv.*.tmp")) == []
 
 
@@ -742,6 +753,7 @@ source "{script}"
 python3() {{
   local target="${{@: -1}}"
   mkdir -m 0700 "$target/bin" "$target/lib"
+  mkdir -p "$target/lib/python3/site-packages"
   printf '#!/bin/bash\nexit 0\n' >"$target/bin/python"
   printf home >"$target/pyvenv.cfg"
   printf private >"$target/private-data"
@@ -804,3 +816,124 @@ create_new_venv "{install_root}"
     assert result.returncode == 2
     assert not (install_root / "venv").exists()
     assert list(install_root.glob(".venv.*.tmp")) == []
+
+
+def _runtime_access_fixture(tmp_path):
+    install_root = tmp_path / "install"
+    venv = install_root / "venv"
+    site_packages = venv / "lib" / "python3" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (venv / "bin").mkdir()
+    python = venv / "bin" / "python"
+    python.write_text(
+        '#!/bin/bash\nprintf executed >"$VENV_SENTINEL"\n', encoding="utf-8"
+    )
+    config = venv / "pyvenv.cfg"
+    config.write_text("home = /usr/bin", encoding="utf-8")
+    module = site_packages / "module.py"
+    module.write_text("VALUE = 1", encoding="utf-8")
+    for directory in (
+        venv,
+        venv / "bin",
+        venv / "lib",
+        venv / "lib" / "python3",
+        site_packages,
+    ):
+        directory.chmod(0o755)
+    python.chmod(0o755)
+    config.chmod(0o644)
+    module.chmod(0o644)
+    return install_root, python, config, module, site_packages
+
+
+def _tree_snapshot(root):
+    return {
+        path.relative_to(root): (
+            stat.S_IMODE(path.lstat().st_mode),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in (root, *root.rglob("*"))
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX other-bit model")
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+@pytest.mark.parametrize(
+    "inaccessible",
+    ["venv", "bin", "lib", "site_packages", "config", "python", "module"],
+)
+def test_existing_venv_inaccessible_to_nonowner_fails_before_python(
+    tmp_path, script_name, inaccessible
+):
+    install_root, python, config, module, site_packages = _runtime_access_fixture(tmp_path)
+    targets = {
+        "venv": install_root / "venv",
+        "bin": install_root / "venv" / "bin",
+        "lib": install_root / "venv" / "lib",
+        "site_packages": site_packages,
+        "config": config,
+        "python": python,
+        "module": module,
+    }
+    targets[inaccessible].chmod(0o700 if targets[inaccessible].is_dir() else 0o600)
+    before = _tree_snapshot(install_root)
+    sentinel = tmp_path / "sentinel"
+    script = ROOT / "scripts" / script_name
+    call = (
+        f'ensure_venv "{install_root}"\n'
+        f'validate_python_runtime "{install_root}" "{python}"'
+        if script_name == "install_ubuntu.sh"
+        else f'verify_python_runtime "{install_root}"'
+    )
+    shell = f'''
+source "{script}"
+require_trusted_tree() {{ :; }}
+require_trusted_file() {{ :; }}
+{call}
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "VENV_SENTINEL": str(sentinel)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == "FAIL/untrusted_installation"
+    assert not sentinel.exists()
+    assert _tree_snapshot(install_root) == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX other-bit model")
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+def test_existing_venv_complete_nonowner_model_reaches_controlled_python(
+    tmp_path, script_name
+):
+    install_root, python, _config, _module, _site_packages = _runtime_access_fixture(tmp_path)
+    sentinel = tmp_path / "sentinel"
+    script = ROOT / "scripts" / script_name
+    call = (
+        f'ensure_venv "{install_root}"\n'
+        f'validate_python_runtime "{install_root}" "{python}"'
+        if script_name == "install_ubuntu.sh"
+        else f'verify_python_runtime "{install_root}"'
+    )
+    shell = f'''
+source "{script}"
+require_trusted_tree() {{ :; }}
+require_trusted_file() {{ :; }}
+{call}
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "VENV_SENTINEL": str(sentinel)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "executed"
