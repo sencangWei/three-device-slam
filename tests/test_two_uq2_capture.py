@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from three_device_slam.core import AppendOnlySessionWriter, SensorRecord
+from three_device_slam.core import session_writer as session_writer_module
 from three_device_slam.devices.two_uq2 import worker as two_uq2_worker
 from three_device_slam.devices.two_uq2.capture import (
     CaptureRuntimeError,
@@ -782,6 +783,7 @@ def install_run_fakes(
     completion,
     duration_s,
     seal_failure=False,
+    formal_failure=False,
 ):
     start_ns = 1_000_000_000
     end_ns = 2_000_000_000
@@ -797,10 +799,11 @@ def install_run_fakes(
             return self.writer.append(record, raw)
 
         def close(self):
-            manifest = self.writer.close()
-            if seal_failure:
+            try:
+                manifest = self.writer.close()
+            except OSError:
                 events.append("writer.seal_failure")
-                raise OSError("seal failed")
+                raise
             events.append("writer.sealed")
             return manifest
 
@@ -859,14 +862,32 @@ def install_run_fakes(
     capture = RunCapture()
     barrier = RunBarrier()
     original_write_acceptance = two_uq2_worker._write_acceptance
+    original_replace = os.replace
+
+    if seal_failure:
+        def fail_manifest_replace(source, target):
+            target_name = Path(target).name
+            if target_name == "manifest.json":
+                events.append("manifest.replace_failure")
+                raise OSError("manifest replace failed")
+            if target_name == "acceptance.json":
+                events.append("acceptance.replace")
+            return original_replace(source, target)
+
+        monkeypatch.setattr(session_writer_module.os, "replace", fail_manifest_replace)
 
     def observe_acceptance(path, report):
         manifest_path = ego_directory / "manifest.json"
-        assert manifest_path.is_file()
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert (ego_directory / "ego.video.bin").read_bytes() == payload
         assert not path.exists()
-        if not seal_failure:
+        if seal_failure:
+            assert not manifest_path.exists()
+            assert events[-1] == "writer.seal_failure"
+            assert report["status"] == "FAIL"
+            assert report["reason"] == "storage_io"
+        else:
+            assert manifest_path.is_file()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             assert events[-1] == "writer.sealed"
             assert report["hashes"]["streams"] == manifest["streams"]
         events.append("acceptance.publish")
@@ -889,11 +910,13 @@ def install_run_fakes(
         "wait_for_scheduled_start",
         lambda *_args, **_kwargs: events.append("barrier.start") or start_ns,
     )
-    monkeypatch.setattr(
-        two_uq2_worker,
-        "run_formal_window",
-        lambda *_args, **_kwargs: events.append(f"formal.{completion}") or end_ns,
-    )
+    def run_formal_window(*_args, **_kwargs):
+        events.append(f"formal.{completion}")
+        if formal_failure:
+            raise CaptureRuntimeFailure("gstreamer_error")
+        return end_ns
+
+    monkeypatch.setattr(two_uq2_worker, "run_formal_window", run_formal_window)
     monkeypatch.setattr(two_uq2_worker, "_evidence", lambda _path: {"python": "3.test"})
     monkeypatch.setattr(two_uq2_worker, "_write_acceptance", observe_acceptance)
 
@@ -956,11 +979,38 @@ def test_run_seal_failure_publishes_fail_not_false_pass(tmp_path, monkeypatch):
     )
     assert report["status"] == "FAIL"
     assert report["reason"] == "storage_io"
-    assert events[-3:] == [
+    assert not (ego_directory / "manifest.json").exists()
+    assert (ego_directory / "ego.video.jsonl").is_file()
+    assert not (ego_directory / ".writer.lock").exists()
+    assert events[-4:] == [
         "writer.seal_failure",
         "acceptance.publish",
+        "acceptance.replace",
         "barrier.failure:storage_io",
     ]
+
+
+def test_run_seal_failure_precedes_existing_capture_failure(tmp_path, monkeypatch):
+    args, events, ego_directory = install_run_fakes(
+        tmp_path,
+        monkeypatch,
+        completion="capture_failure",
+        duration_s=1.0,
+        seal_failure=True,
+        formal_failure=True,
+    )
+
+    assert two_uq2_worker.run(args) == 2
+
+    assert "formal.capture_failure" in events
+    assert "manifest.replace_failure" in events
+    assert "acceptance.replace" in events
+    assert not (ego_directory / "manifest.json").exists()
+    report = json.loads(
+        (ego_directory / "acceptance.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "storage_io"
 
 
 def test_standalone_start_is_scheduled_in_future_for_raw_warmup():
