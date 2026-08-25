@@ -73,6 +73,7 @@ def _run_product(config, stop_event: threading.Event) -> int:
     try:
         capture_result = run_capture(config, stop_event.is_set)
         acquisition_status = _status(capture_result.report, "capture")
+        calibration_status = _calibration_status(capture_result.report)
         session = Path(capture_result.session)
     except Exception:
         _error("FAIL/capture_exception")
@@ -101,6 +102,10 @@ def _run_product(config, stop_event: threading.Event) -> int:
         _error("FAIL/verification_exception")
         return EXIT_CODES["FAIL"]
     print(f"verification={verification_status}")
+    print(f"calibration={calibration_status}")
+    overall = max(
+        (overall, calibration_status), key={"PASS": 0, "BLOCKED": 1, "FAIL": 2}.get
+    )
     print(f"overall={overall}")
     return EXIT_CODES[overall]
 
@@ -109,6 +114,23 @@ def _status(report, stage: str) -> str:
     if not isinstance(report, dict) or report.get("status") not in EXIT_CODES:
         raise ValueError(f"invalid {stage} report")
     return report["status"]
+
+
+def _calibration_status(report) -> str:
+    expectations = report.get("calibration_expectations")
+    if not isinstance(expectations, dict) or set(expectations) != {
+        "ego",
+        "left",
+        "right",
+    }:
+        return "BLOCKED"
+    statuses = []
+    for device in ("ego", "left", "right"):
+        item = expectations[device]
+        if not isinstance(item, dict) or item.get("status") not in EXIT_CODES:
+            return "FAIL"
+        statuses.append(item["status"])
+    return max(statuses, key={"PASS": 0, "BLOCKED": 1, "FAIL": 2}.get)
 
 
 def _error(reason: str) -> None:

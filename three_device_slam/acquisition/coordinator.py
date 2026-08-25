@@ -50,8 +50,10 @@ def run_coordinator(
     *,
     auto_start: bool = True,
     stop_requested: Callable[[], bool] = lambda: False,
+    expected_calibration_ids: Mapping[str, str] | None = None,
 ) -> dict:
     """Run the three capture workers and return their durable coordinator report."""
+    _validate_calibration_expectations(expected_calibration_ids)
     try:
         with producer_claim(session, "coordinator"):
             return _run_coordinator_claimed(
@@ -61,10 +63,15 @@ def run_coordinator(
                 clock_ns,
                 auto_start=auto_start,
                 stop_requested=stop_requested,
+                expected_calibration_ids=expected_calibration_ids,
             )
     except OSError as exc:
         return _initial_storage_failure_report(
-            Path(session), worker_commands, clock_ns(), type(exc).__name__
+            Path(session),
+            worker_commands,
+            clock_ns(),
+            type(exc).__name__,
+            expected_calibration_ids,
         )
 
 
@@ -76,6 +83,7 @@ def _run_coordinator_claimed(
     *,
     auto_start: bool = True,
     stop_requested: Callable[[], bool] = lambda: False,
+    expected_calibration_ids: Mapping[str, str] | None = None,
 ) -> dict:
     session = Path(session)
     _validate_run_inputs(worker_commands, duration_s)
@@ -86,7 +94,11 @@ def _run_coordinator_claimed(
         barrier = BarrierDirectory(session)
     except OSError as exc:
         return _initial_storage_failure_report(
-            session, worker_commands, launch_ns, type(exc).__name__
+            session,
+            worker_commands,
+            launch_ns,
+            type(exc).__name__,
+            expected_calibration_ids,
         )
     gate = JointWarmupGate(
         REQUIRED_DEVICES,
@@ -645,6 +657,11 @@ def _run_coordinator_claimed(
         "coordinator_errors": coordinator_errors,
         "first_error": first_error,
     }
+    calibration_expectations = _calibration_expectations(
+        expected_calibration_ids, trusted_acceptances
+    )
+    if calibration_expectations is not None:
+        report["calibration_expectations"] = calibration_expectations
     try:
         _write_atomic_json(session / "coordinator.json", report)
     except OSError as exc:
@@ -684,7 +701,11 @@ def _safe_latch_failure(
 
 
 def _initial_storage_failure_report(
-    session: Path, worker_commands: dict[str, list[str]], at_ns: int, detail: str
+    session: Path,
+    worker_commands: dict[str, list[str]],
+    at_ns: int,
+    detail: str,
+    expected_calibration_ids: Mapping[str, str] | None = None,
 ) -> dict:
     error = {"reason": "storage_io", "at_ns": at_ns, "detail": detail}
     report = {
@@ -718,6 +739,11 @@ def _initial_storage_failure_report(
         "coordinator_errors": [error],
         "first_error": error,
     }
+    calibration_expectations = _calibration_expectations(
+        expected_calibration_ids, {}
+    )
+    if calibration_expectations is not None:
+        report["calibration_expectations"] = calibration_expectations
     try:
         _write_atomic_json(session / "coordinator.json", report)
     except OSError:
@@ -924,7 +950,7 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
             return None
         calibration_id = acceptance.get("calibration_id")
         if calibration_id is not None and (
-            not isinstance(calibration_id, str) or not calibration_id
+            not isinstance(calibration_id, str) or not calibration_id.strip()
         ):
             return None
         status = acceptance.get("status")
@@ -936,7 +962,7 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
         live_vins = acceptance.get("live_vins", {})
         calibration_id = live_vins.get("imu_calibration")
         if calibration_id is not None and (
-            not isinstance(calibration_id, str) or not calibration_id
+            not isinstance(calibration_id, str) or not calibration_id.strip()
         ):
             return None
         status = acceptance.get("result")
@@ -968,16 +994,11 @@ def _calibration_evidence_ids(acceptances):
         if not isinstance(acceptance, Mapping):
             acceptance = {}
         if device == "ego":
-            hashes = acceptance.get("hashes")
-            evidence_id = (
-                hashes.get("xu_library_sha256")
-                if isinstance(hashes, Mapping)
-                else None
-            )
+            calibration_id = acceptance.get("calibration_id")
             result[device] = {
-                "calibration_id": None,
-                "evidence_id": evidence_id,
-                "available": evidence_id is not None,
+                "calibration_id": calibration_id,
+                "evidence_id": None,
+                "available": calibration_id is not None,
             }
         else:
             live_vins = acceptance.get("live_vins")
@@ -990,6 +1011,60 @@ def _calibration_evidence_ids(acceptances):
                 "calibration_id": calibration_id,
                 "evidence_id": None,
                 "available": calibration_id is not None,
+            }
+    return result
+
+
+def _validate_calibration_expectations(expected_calibration_ids) -> None:
+    if expected_calibration_ids is None:
+        return
+    if not isinstance(expected_calibration_ids, Mapping) or set(
+        expected_calibration_ids
+    ) != set(REQUIRED_DEVICES):
+        raise ValueError(
+            "expected calibration IDs must contain exactly ego, left, and right"
+        )
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in expected_calibration_ids.values()
+    ):
+        raise ValueError("expected calibration IDs must be non-empty strings")
+
+
+def _calibration_expectations(expected_calibration_ids, acceptances):
+    if expected_calibration_ids is None:
+        return None
+    result = {}
+    for device in REQUIRED_DEVICES:
+        acceptance = acceptances.get(device)
+        observed = None
+        if isinstance(acceptance, Mapping):
+            if device == "ego":
+                observed = acceptance.get("calibration_id")
+            else:
+                live_vins = acceptance.get("live_vins")
+                if isinstance(live_vins, Mapping):
+                    observed = live_vins.get("imu_calibration")
+        expected = expected_calibration_ids[device]
+        if observed is None:
+            result[device] = {
+                "expected": expected,
+                "observed": None,
+                "status": "BLOCKED",
+                "reason": "evidence_unavailable",
+            }
+        elif observed != expected:
+            result[device] = {
+                "expected": expected,
+                "observed": observed,
+                "status": "FAIL",
+                "reason": "mismatch",
+            }
+        else:
+            result[device] = {
+                "expected": expected,
+                "observed": observed,
+                "status": "PASS",
             }
     return result
 
@@ -1179,6 +1254,11 @@ def run_product_capture(config, stop_requested) -> CaptureResult:
         config.duration_s,
         auto_start=True,
         stop_requested=stop_requested,
+        expected_calibration_ids={
+            "ego": config.ego.calibration_id,
+            "left": config.left.calibration_id,
+            "right": config.right.calibration_id,
+        },
     )
     return CaptureResult(session=session, report=report)
 

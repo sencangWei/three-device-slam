@@ -65,6 +65,8 @@ def load_product_config(path: Path | str) -> ProductConfig:
     right = _umi(root["right"], "right")
     if left.serial == right.serial:
         raise ConfigError("left and right D405 identities must be distinct")
+    if left.imu_path == right.imu_path:
+        raise ConfigError("left and right IMU paths must be distinct")
 
     ego_value = _object(root["ego"], "ego")
     _exact_fields(

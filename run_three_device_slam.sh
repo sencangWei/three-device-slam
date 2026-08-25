@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-exec python3 -m three_device_slam.cli "$@"
+exec /opt/three-device-slam/venv/bin/python -I -B -m three_device_slam.cli "$@"

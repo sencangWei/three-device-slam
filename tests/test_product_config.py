@@ -57,6 +57,14 @@ def test_rejects_duplicate_d405_identity(tmp_path):
         load_product_config(write_payload(tmp_path, payload))
 
 
+def test_rejects_duplicate_d405_imu_path(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload["right"]["imu_path"] = payload["left"]["imu_path"]
+
+    with pytest.raises(ConfigError, match="IMU paths must be distinct"):
+        load_product_config(write_payload(tmp_path, payload))
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

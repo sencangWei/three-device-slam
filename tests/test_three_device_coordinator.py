@@ -169,6 +169,7 @@ def run_fake_session(
     on_prompt=None,
     clock=None,
     stop_requested=lambda: False,
+    expected_calibration_ids=None,
 ):
     session = tmp_path / "session"
     clock = clock or FakeClock()
@@ -206,6 +207,7 @@ def run_fake_session(
         clock_ns=clock,
         auto_start=auto_start,
         stop_requested=stop_requested,
+        expected_calibration_ids=expected_calibration_ids,
     )
     return session, clock, processes, launches, report
 
@@ -1399,9 +1401,21 @@ def test_worker_commands_omit_duration_when_config_has_none(tmp_path):
 
 def test_run_product_capture_returns_created_session_and_report(tmp_path, monkeypatch):
     config = SimpleNamespace(
-        left=SimpleNamespace(serial="left-serial", imu_path="/dev/left-imu"),
-        right=SimpleNamespace(serial="right-serial", imu_path="/dev/right-imu"),
-        ego=SimpleNamespace(video_device="/dev/video0", xu_library="/opt/libxu.so"),
+        left=SimpleNamespace(
+            serial="left-serial",
+            imu_path="/dev/left-imu",
+            calibration_id="left-cal",
+        ),
+        right=SimpleNamespace(
+            serial="right-serial",
+            imu_path="/dev/right-imu",
+            calibration_id="right-cal",
+        ),
+        ego=SimpleNamespace(
+            video_device="/dev/video0",
+            xu_library="/opt/libxu.so",
+            calibration_id="ego-cal",
+        ),
         duration_s=None,
         output_root=tmp_path,
     )
@@ -1422,6 +1436,153 @@ def test_run_product_capture_returns_created_session_and_report(tmp_path, monkey
     assert result.session == tmp_path / "session"
     assert result.report["duration_s"] is None
     assert result.report["options"]["auto_start"] is True
+    assert result.report["options"]["expected_calibration_ids"] == {
+        "ego": "ego-cal",
+        "left": "left-cal",
+        "right": "right-cal",
+    }
+
+
+def test_calibration_expectations_are_durable_and_match_trusted_acceptance(
+    tmp_path, monkeypatch
+):
+    expected = {"ego": "ego-cal", "left": "left-cal", "right": "right-cal"}
+    behaviors = {
+        "ego": {
+            "acceptance_payload": {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "calibration_id": "ego-cal",
+                "formal_evidence": {},
+                "hashes": {},
+            }
+        },
+        "left": {
+            "acceptance_payload": {
+                "result": "PASS",
+                "live_vins": {"imu_calibration": "left-cal"},
+            }
+        },
+        "right": {
+            "acceptance_payload": {
+                "result": "PASS",
+                "live_vins": {"imu_calibration": "right-cal"},
+            }
+        },
+    }
+
+    session, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors=behaviors,
+        expected_calibration_ids=expected,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["calibration_expectations"] == {
+        device: {"expected": value, "observed": value, "status": "PASS"}
+        for device, value in expected.items()
+    }
+    assert report["calibration_evidence_ids"]["ego"] == {
+        "calibration_id": "ego-cal",
+        "evidence_id": None,
+        "available": True,
+    }
+    assert json.loads((session / "coordinator.json").read_text())["calibration_expectations"] == report["calibration_expectations"]
+
+
+@pytest.mark.parametrize(
+    ("observed", "status", "reason"),
+    [("other-cal", "FAIL", "mismatch"), (None, "BLOCKED", "evidence_unavailable")],
+)
+def test_calibration_expectation_mismatch_and_unavailable_do_not_change_timing_status(
+    tmp_path, monkeypatch, observed, status, reason
+):
+    payload = {"result": "PASS", "live_vins": {"imu_calibration": observed}}
+    _, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors={"left": {"acceptance_payload": payload}},
+        expected_calibration_ids={"ego": "ego-cal", "left": "left-cal", "right": "right-cal"},
+    )
+
+    assert report["status"] == "PASS"
+    assert report["calibration_expectations"]["left"] == {
+        "expected": "left-cal",
+        "observed": observed,
+        "status": status,
+        "reason": reason,
+    }
+
+
+def test_invalid_acceptance_cannot_supply_observed_calibration(tmp_path, monkeypatch):
+    _, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors={
+            "left": {
+                "acceptance_payload": {
+                    "result": "PASS",
+                    "live_vins": {"imu_calibration": ["left-cal"]},
+                }
+            }
+        },
+        expected_calibration_ids={"ego": "ego-cal", "left": "left-cal", "right": "right-cal"},
+    )
+
+    assert report["calibration_expectations"]["left"]["observed"] is None
+    assert report["calibration_expectations"]["left"]["status"] == "BLOCKED"
+
+
+@pytest.mark.parametrize(
+    ("device", "payload"),
+    [
+        ("left", {"result": "PASS", "live_vins": {"imu_calibration": "  "}}),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "calibration_id": "  ",
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+    ],
+)
+def test_blank_acceptance_calibration_is_invalid_and_unobserved(
+    tmp_path, monkeypatch, device, payload
+):
+    _, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors={device: {"acceptance_payload": payload}},
+        expected_calibration_ids={"ego": "ego-cal", "left": "left-cal", "right": "right-cal"},
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["calibration_expectations"][device]["observed"] is None
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        {},
+        {"ego": "ego", "left": "left", "right": ""},
+        {"ego": "ego", "left": "left", "right": "right", "extra": "x"},
+    ],
+)
+def test_invalid_calibration_expectations_rejected_before_workers(
+    tmp_path, monkeypatch, expected
+):
+    monkeypatch.setattr(coordinator, "_popen", lambda *_args: pytest.fail("worker opened"))
+    with pytest.raises(ValueError, match="calibration"):
+        coordinator.run_coordinator(
+            tmp_path / "session",
+            {device: [device] for device in DEVICES},
+            1.0,
+            expected_calibration_ids=expected,
+        )
 
 
 def test_coordinator_module_help_runs_directly_from_repository_root():

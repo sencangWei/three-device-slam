@@ -14,7 +14,15 @@ def fake_config(tmp_path):
 def test_product_runs_capture_index_verify_in_order(tmp_path, monkeypatch, capsys):
     events = []
     monkeypatch.setattr(cli, "load_product_config", lambda _path: fake_config(tmp_path))
-    capture = SimpleNamespace(session=tmp_path / "session", report={"status": "PASS"})
+    capture = SimpleNamespace(
+        session=tmp_path / "session",
+        report={
+            "status": "PASS",
+            "calibration_expectations": {
+                device: {"status": "PASS"} for device in ("ego", "left", "right")
+            },
+        },
+    )
     monkeypatch.setattr(
         cli, "run_capture", lambda _config, _stop: events.append("capture") or capture
     )
@@ -32,6 +40,7 @@ def test_product_runs_capture_index_verify_in_order(tmp_path, monkeypatch, capsy
     assert "acquisition=PASS" in output
     assert "index=PASS" in output
     assert "verification=PASS" in output
+    assert "calibration=PASS" in output
     assert "overall=BLOCKED" in output
 
 
@@ -142,3 +151,31 @@ def test_verification_fail_controls_exit_code(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "verify_session", lambda _session: {"status": "FAIL"})
 
     assert cli.main(["product", "--config", str(tmp_path / "product.json")]) == 2
+
+
+@pytest.mark.parametrize(
+    ("calibration_status", "expected_exit"), [("FAIL", 2), ("BLOCKED", 3)]
+)
+def test_calibration_result_controls_final_exit_after_offline_processing(
+    tmp_path, monkeypatch, capsys, calibration_status, expected_exit
+):
+    events = []
+    monkeypatch.setattr(cli, "load_product_config", lambda _path: fake_config(tmp_path))
+    capture = SimpleNamespace(
+        session=tmp_path / "session",
+        report={
+            "status": "PASS",
+            "calibration_expectations": {
+                "ego": {"status": calibration_status},
+                "left": {"status": "PASS"},
+                "right": {"status": "PASS"},
+            },
+        },
+    )
+    monkeypatch.setattr(cli, "run_capture", lambda *_args: events.append("capture") or capture)
+    monkeypatch.setattr(cli, "build_index", lambda _session: events.append("index") or {})
+    monkeypatch.setattr(cli, "verify_session", lambda _session: events.append("verify") or {"status": "PASS"})
+
+    assert cli.main(["product", "--config", str(tmp_path / "product.json")]) == expected_exit
+    assert events == ["capture", "index", "verify"]
+    assert f"calibration={calibration_status}" in capsys.readouterr().out
