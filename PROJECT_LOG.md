@@ -11,6 +11,6 @@
 - 用户确认量产不依赖每次拍标定板或外露 tag；空间链路采用 Ego 主轨迹、无标记双 UMI 6D 观测、各自 VIO 增量和左右独立因子图。
 - 完整仓库设计已写入 docs/superpowers/specs/2026-08-25-three-device-slam-repository-design.md。
 
-当前状态：仅建立独立本地 Git 仓库和设计文档，尚未迁移或修改任何产品代码，尚未创建远端 GitHub 仓库。
+当前状态：用户已批准仓库设计。仅建立独立本地 Git 仓库、设计和实施计划，尚未迁移或修改任何产品代码，尚未创建远端 GitHub 仓库。
 
-下一步：用户审阅设计文档；批准后编写逐文件实施计划。
+下一步：按 docs/superpowers/plans/2026-08-25-acquisition-sync-clean-extraction.md 执行第一阶段干净提取；执行方式由用户选择。
