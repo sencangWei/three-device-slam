@@ -184,6 +184,7 @@ def test_close_failure_releases_writer_claim(tmp_path, monkeypatch):
         SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
         b"raw",
     )
+    stream_files = writer._streams["ego.video"]
 
     def fail_replace(*_args):
         raise OSError("simulated manifest publish failure")
@@ -195,4 +196,111 @@ def test_close_failure_releases_writer_claim(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="simulated manifest publish failure"):
         writer.close()
 
+    assert not (tmp_path / "manifest.json").exists()
     assert not (tmp_path / ".writer.lock").exists()
+    assert all(file.closed for file in stream_files)
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.append(
+            SensorRecord("ego.video", 2, 2, 2, "host_monotonic", False, True, {}),
+            b"forbidden",
+        )
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.close()
+
+
+def test_early_close_failure_is_terminal_and_closes_streams(tmp_path, monkeypatch):
+    writer = AppendOnlySessionWriter(tmp_path)
+    writer.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"raw",
+    )
+    stream_files = writer._streams["ego.video"]
+    original_fsync = __import__("os").fsync
+    calls = 0
+
+    def fail_first_fsync(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated raw fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(
+        "three_device_slam.core.session_writer.os.fsync", fail_first_fsync
+    )
+
+    with pytest.raises(OSError, match="simulated raw fsync failure"):
+        writer.close()
+
+    payload_path = tmp_path / "ego.video.bin"
+    payload_after_failure = payload_path.read_bytes()
+    assert all(file.closed for file in stream_files)
+    assert not (tmp_path / ".writer.lock").exists()
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.append(
+            SensorRecord("ego.video", 2, 2, 2, "host_monotonic", False, True, {}),
+            b"forbidden",
+        )
+    assert payload_path.read_bytes() == payload_after_failure
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.close()
+
+
+def test_directory_fsync_failure_is_terminal_after_manifest_replace(
+    tmp_path, monkeypatch
+):
+    writer = AppendOnlySessionWriter(tmp_path)
+    writer.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"raw",
+    )
+    original_fsync = __import__("os").fsync
+
+    def fail_directory_fsync(fd):
+        if (tmp_path / "manifest.json").exists():
+            raise OSError("simulated directory fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(
+        "three_device_slam.core.session_writer.os.fsync", fail_directory_fsync
+    )
+
+    with pytest.raises(OSError, match="simulated directory fsync failure"):
+        writer.close()
+
+    assert (tmp_path / "manifest.json").exists()
+    assert not (tmp_path / ".writer.lock").exists()
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.append(
+            SensorRecord("ego.video", 2, 2, 2, "host_monotonic", False, True, {}),
+            b"forbidden",
+        )
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.close()
+    with pytest.raises(RuntimeError, match="sealed"):
+        AppendOnlySessionWriter(tmp_path)
+    assert not (tmp_path / ".writer.lock").exists()
+
+
+def test_close_cleanup_does_not_mask_original_error(tmp_path, monkeypatch):
+    writer = AppendOnlySessionWriter(tmp_path)
+    writer.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"raw",
+    )
+
+    def fail_primary(_fd):
+        raise OSError("primary close failure")
+
+    def fail_cleanup():
+        raise OSError("secondary cleanup failure")
+
+    monkeypatch.setattr("three_device_slam.core.session_writer.os.fsync", fail_primary)
+    monkeypatch.setattr(writer, "_close_streams_best_effort", fail_cleanup)
+
+    with pytest.raises(OSError, match="primary close failure"):
+        writer.close()
+
+    assert not (tmp_path / ".writer.lock").exists()
+    with pytest.raises(RuntimeError, match="terminal"):
+        writer.close()

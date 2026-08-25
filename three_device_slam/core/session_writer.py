@@ -38,19 +38,22 @@ class AppendOnlySessionWriter:
                 raise RuntimeError("session is sealed")
             self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}
             self._manifest: dict | None = None
+            self._state = "active"
         except BaseException:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-            self._release_claim()
+            self._release_claim_best_effort()
             raise
 
     def append(
         self, record: SensorRecord, payload: bytes | bytearray | memoryview
     ) -> str:
-        if self._manifest is not None:
+        if self._state == "failed":
+            raise RuntimeError("writer is terminally failed")
+        if self._state != "active":
             raise RuntimeError("writer is closed")
 
         self._validate_stream_id(record.stream_id)
@@ -76,8 +79,10 @@ class AppendOnlySessionWriter:
         return f"{record.stream_id}.bin:{offset}:{len(payload_bytes)}"
 
     def close(self) -> dict:
-        if self._manifest is not None:
+        if self._state == "sealed":
             return self._manifest
+        if self._state == "failed":
+            raise RuntimeError("writer is terminally failed")
 
         try:
             streams = {}
@@ -90,13 +95,13 @@ class AppendOnlySessionWriter:
                     "payload_sha256": self._sha256(self.root / f"{stream_id}.bin"),
                     "index_sha256": self._sha256(self.root / f"{stream_id}.jsonl"),
                 }
-            self._manifest = {
+            manifest = {
                 "schema": "ego.three_device.raw_session.v1",
                 "streams": streams,
             }
             temporary = self.root / "manifest.json.tmp"
             with temporary.open("w", encoding="utf-8") as file:
-                json.dump(self._manifest, file, sort_keys=True)
+                json.dump(manifest, file, sort_keys=True)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, self.root / "manifest.json")
@@ -105,15 +110,43 @@ class AppendOnlySessionWriter:
                 os.fsync(directory)
             finally:
                 os.close(directory)
-            return self._manifest
-        finally:
             self._release_claim()
+        except BaseException:
+            self._state = "failed"
+            try:
+                self._close_streams_best_effort()
+            except BaseException:
+                pass
+            try:
+                self._release_claim_best_effort()
+            except BaseException:
+                pass
+            raise
+        self._manifest = manifest
+        self._state = "sealed"
+        return self._manifest
+
+    def _close_streams_best_effort(self) -> None:
+        for stream_files in self._streams.values():
+            for file in stream_files:
+                if file.closed:
+                    continue
+                try:
+                    file.close()
+                except BaseException:
+                    pass
 
     def _release_claim(self) -> None:
         if not self._claim_owned:
             return
         self._claim_path.unlink()
         self._claim_owned = False
+
+    def _release_claim_best_effort(self) -> None:
+        try:
+            self._release_claim()
+        except BaseException:
+            pass
 
     @staticmethod
     def _sha256(path: Path) -> str:
