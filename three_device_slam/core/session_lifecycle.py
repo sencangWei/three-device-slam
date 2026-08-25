@@ -60,11 +60,7 @@ def assert_safe_path(
     return info
 
 
-def assert_producer_writes_allowed(session_directory: Path) -> None:
-    directory = Path(session_directory)
-    session_root = directory.parent if directory.name in {"ego", "left", "right"} else directory
-    if not session_root.exists():
-        return
+def assert_session_open_for_producers(session_root: Path) -> Path:
     root = canonical_session_root(session_root)
     for name, reason in (
         (SEAL_NAME, "session is sealed"),
@@ -74,6 +70,7 @@ def assert_producer_writes_allowed(session_directory: Path) -> None:
         info = assert_safe_path(marker, root, name, kind="file")
         if info is not None:
             raise RuntimeError(reason)
+    return root
 
 
 @contextmanager
@@ -81,13 +78,13 @@ def producer_claim(session: Path, producer_id: str):
     if not isinstance(producer_id, str) or not _SAFE_ID.fullmatch(producer_id):
         raise ValueError("producer_id must be a safe token")
     root = canonical_session_root(session, create=True)
-    assert_producer_writes_allowed(root)
+    assert_session_open_for_producers(root)
     claim_path = root / f".producer.{producer_id}.lock"
     identity = _create_claim(claim_path, root, f"producer {producer_id}")
     try:
         _claim_created_hook("producer", root)
         try:
-            assert_producer_writes_allowed(root)
+            assert_session_open_for_producers(root)
         except BaseException:
             _release_claim(claim_path, root, identity)
             identity = None
@@ -136,16 +133,39 @@ def _create_claim(
         if path.name == OFFLINE_CLAIM_NAME:
             raise RuntimeError("offline publication already in progress") from exc
         raise RuntimeError(f"{label} already active") from exc
+    identity = None
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
-            raise ValueError(f"unsafe {label} claim")
-        os.fsync(descriptor)
-        identity = _identity(info)
-    finally:
-        os.close(descriptor)
-    _fsync_directory(root)
+        try:
+            info = os.fstat(descriptor)
+            identity = _identity(info)
+            if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
+                raise ValueError(f"unsafe {label} claim")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(root)
+    except BaseException:
+        _rollback_new_claim(path, root, identity)
+        raise
     return identity
+
+
+def _rollback_new_claim(
+    path: Path,
+    root: Path,
+    expected_identity: tuple[int, int, int, int, int] | None,
+) -> None:
+    try:
+        info = assert_safe_path(path, root, path.name, kind="file")
+        if expected_identity is not None and info is not None:
+            if _identity(info) == expected_identity:
+                path.unlink()
+    except BaseException:
+        return
+    try:
+        _fsync_directory(root)
+    except BaseException:
+        pass
 
 
 def _release_claim(
@@ -196,9 +216,18 @@ def _identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(descriptor)
+        descriptor = os.open(path, os.O_RDONLY)
+    except PermissionError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except PermissionError:
+            if os.name != "nt":
+                raise
     finally:
         os.close(descriptor)
 

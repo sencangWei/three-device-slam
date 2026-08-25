@@ -1,5 +1,8 @@
 import hashlib
 import json
+import stat
+from pathlib import Path
+from types import SimpleNamespace
 from zlib import crc32
 
 import pytest
@@ -327,6 +330,18 @@ def test_producer_and_offline_claims_are_mutually_exclusive_and_cleaned(tmp_path
     assert not (session / ".offline.lock").exists()
 
 
+def test_producer_claim_checks_markers_when_session_root_has_device_name(tmp_path):
+    session = tmp_path / "ego"
+    session.mkdir()
+    (session / "session.seal.json").write_text("sealed", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        with producer_claim(session, "ego"):
+            raise AssertionError("sealed named session entered producer claim")
+
+    assert not (session / ".producer.ego.lock").exists()
+
+
 @pytest.mark.parametrize("stale", [".producer.ego.lock", ".offline.lock"])
 def test_crash_residue_fails_safe_without_stale_recovery(tmp_path, stale):
     session = tmp_path / "session"
@@ -356,6 +371,132 @@ def test_append_only_writer_rejects_session_lifecycle_marker_before_writing(
         AppendOnlySessionWriter(ego)
 
     assert list(ego.iterdir()) == []
+
+
+@pytest.mark.parametrize("marker", ["session.seal.json", ".offline.lock"])
+def test_writer_rejects_lifecycle_marker_without_creating_missing_root(
+    tmp_path, marker
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    (session / marker).write_text("blocked", encoding="utf-8")
+    writer_root = session / "ego"
+
+    with pytest.raises(RuntimeError, match="sealed|offline"):
+        AppendOnlySessionWriter(writer_root)
+
+    assert not writer_root.exists()
+
+
+def test_writer_rejects_symlink_root_without_writing_outside(tmp_path):
+    session = tmp_path / "session"
+    outside = tmp_path / "outside"
+    session.mkdir()
+    outside.mkdir()
+    writer_root = session / "ego"
+    writer_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        AppendOnlySessionWriter(writer_root)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_windows_reparse_attribute_is_rejected_by_writer_path_guard():
+    simulated = SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_file_attributes=session_lifecycle._REPARSE_POINT,
+    )
+
+    with pytest.raises(ValueError, match="symlink or reparse"):
+        session_lifecycle._reject_link_or_reparse(simulated, "writer root")
+
+
+def test_missing_writer_root_is_created_safely_while_producer_claim_is_held(tmp_path):
+    session = tmp_path / "session"
+    session.mkdir()
+    writer_root = session / "arbitrary-capture"
+
+    with producer_claim(session, "ego"):
+        writer = AppendOnlySessionWriter(writer_root)
+        writer.append(
+            SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+            b"raw",
+        )
+        writer.close()
+
+    assert (writer_root / "ego.video.bin").read_bytes() == b"raw"
+    assert (writer_root / "manifest.json").is_file()
+    assert not (writer_root / ".writer.lock").exists()
+
+
+def test_claim_creation_fsync_failure_removes_new_claim(tmp_path, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    calls = 0
+    original = session_lifecycle._fsync_directory
+
+    def fail_first_directory_fsync(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("directory fsync unsupported")
+        return original(path)
+
+    monkeypatch.setattr(
+        session_lifecycle, "_fsync_directory", fail_first_directory_fsync
+    )
+
+    with pytest.raises(PermissionError, match="directory fsync unsupported"):
+        with producer_claim(session, "ego"):
+            raise AssertionError("claim entered after failed durability step")
+
+    assert not (session / ".producer.ego.lock").exists()
+
+
+def test_writer_root_creation_race_removes_only_its_empty_directory(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    writer_root = session / "capture"
+    original_mkdir = Path.mkdir
+
+    def add_offline_claim_after_root_creation(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        if path == writer_root:
+            (session / ".offline.lock").write_bytes(b"")
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", add_offline_claim_after_root_creation)
+
+    with pytest.raises(RuntimeError, match="offline"):
+        AppendOnlySessionWriter(writer_root)
+
+    assert not writer_root.exists()
+
+
+def test_writer_root_creation_race_preserves_nonempty_directory(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    writer_root = session / "capture"
+    original_mkdir = Path.mkdir
+
+    def add_concurrent_content_after_root_creation(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        if path == writer_root:
+            (writer_root / "other-process.txt").write_text("keep", encoding="utf-8")
+            (session / ".offline.lock").write_bytes(b"")
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", add_concurrent_content_after_root_creation)
+
+    with pytest.raises(RuntimeError, match="offline"):
+        AppendOnlySessionWriter(writer_root)
+
+    assert (writer_root / "other-process.txt").read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.parametrize("winner", ["producer", "offline"])

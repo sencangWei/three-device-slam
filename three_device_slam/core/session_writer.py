@@ -8,7 +8,11 @@ from typing import BinaryIO
 from zlib import crc32
 
 from .model import SensorRecord
-from .session_lifecycle import assert_producer_writes_allowed
+from .session_lifecycle import (
+    assert_safe_path,
+    assert_session_open_for_producers,
+    canonical_session_root,
+)
 
 
 _SAFE_STREAM_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
@@ -21,9 +25,7 @@ _RESERVED_STREAM_IDS = {"CON", "PRN", "AUX", "NUL"} | {
 
 class AppendOnlySessionWriter:
     def __init__(self, root: Path):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        assert_producer_writes_allowed(self.root)
+        self.root, created_identity = _prepare_writer_root(root)
         self._claim_path = self.root / ".writer.lock"
         self._claim_owned = False
         try:
@@ -32,11 +34,14 @@ class AppendOnlySessionWriter:
             )
         except FileExistsError as error:
             raise RuntimeError("session already has an active writer") from error
+        except BaseException:
+            _remove_created_writer_root(self.root, created_identity)
+            raise
         self._claim_owned = True
         try:
             os.close(descriptor)
             descriptor = None
-            assert_producer_writes_allowed(self.root)
+            assert_session_open_for_producers(self.root.parent)
             if (self.root / "manifest.json").exists():
                 raise RuntimeError("session is sealed")
             self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}
@@ -49,6 +54,7 @@ class AppendOnlySessionWriter:
                 except OSError:
                     pass
             self._release_claim_best_effort()
+            _remove_created_writer_root(self.root, created_identity)
             raise
 
     def append(
@@ -175,3 +181,55 @@ class AppendOnlySessionWriter:
             or stream_id.split(".", 1)[0].upper() in _RESERVED_STREAM_IDS
         ):
             raise ValueError("stream_id must be a safe filename token")
+
+
+def prepare_session_writer_root(root: Path) -> Path:
+    prepared, _created_identity = _prepare_writer_root(root)
+    return prepared
+
+
+def _prepare_writer_root(root: Path) -> tuple[Path, tuple[int, int] | None]:
+    requested = Path(root)
+    name = requested.name
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("writer root must be a safe direct-child name")
+    absolute = Path(os.path.abspath(requested))
+    parent = canonical_session_root(absolute.parent)
+    if absolute != parent / name:
+        raise ValueError("writer root must be a canonical direct child")
+
+    assert_session_open_for_producers(parent)
+    existing = assert_safe_path(
+        absolute, parent, "writer root", kind="directory"
+    )
+    created_identity = None
+    if existing is None:
+        absolute.mkdir(parents=False)
+        created_identity = _directory_identity(absolute.lstat())
+    try:
+        assert_safe_path(absolute, parent, "writer root", kind="directory")
+        assert_session_open_for_producers(parent)
+    except BaseException:
+        _remove_created_writer_root(absolute, created_identity)
+        raise
+    return absolute, created_identity
+
+
+def _remove_created_writer_root(
+    root: Path, expected_identity: tuple[int, int] | None
+) -> None:
+    if expected_identity is None:
+        return
+    try:
+        info = assert_safe_path(root, root.parent, "writer root", kind="directory")
+        if info is None or _directory_identity(info) != expected_identity:
+            return
+        if any(root.iterdir()):
+            return
+        root.rmdir()
+    except BaseException:
+        pass
+
+
+def _directory_identity(info) -> tuple[int, int]:
+    return info.st_dev, info.st_ino

@@ -790,6 +790,7 @@ def install_run_fakes(
     payload = b"encoded-2uq2-raw"
     events = []
     ego_directory = tmp_path / "session" / "ego"
+    ego_directory.parent.mkdir()
 
     class EventWriter:
         def __init__(self):
@@ -1571,6 +1572,40 @@ def test_storage_setup_failure_is_typed_without_path_details(tmp_path):
         setup_storage(tmp_path, writer_factory=broken_writer)
 
     assert str(caught.value) == "storage_io"
+
+
+def test_setup_storage_does_not_create_ego_before_writer_path_guard(tmp_path):
+    ego = tmp_path / "ego"
+
+    def observe_writer(root):
+        assert root == ego
+        assert not root.exists()
+        raise OSError("stop after path observation")
+
+    with pytest.raises(StorageIoFailure):
+        setup_storage(tmp_path, writer_factory=observe_writer)
+
+    assert not ego.exists()
+
+
+def test_storage_failure_report_does_not_follow_unsafe_ego_symlink(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "session"
+    outside = tmp_path / "outside"
+    session.mkdir()
+    outside.mkdir()
+    (session / "ego").symlink_to(outside, target_is_directory=True)
+
+    def fail_setup(_session):
+        raise StorageIoFailure()
+
+    monkeypatch.setattr(two_uq2_worker, "setup_storage", fail_setup)
+    args = SimpleNamespace(session=session, duration=1.0)
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        two_uq2_worker.run(args)
+    assert list(outside.iterdir()) == []
 
 
 class BrokenBarrier:

@@ -24,6 +24,7 @@ from three_device_slam.core import BarrierDirectory
 from three_device_slam.core import DeviceHeartbeat, SensorRecord
 from three_device_slam.core import AppendOnlySessionWriter
 from three_device_slam.core.session_lifecycle import producer_claim
+from three_device_slam.core.session_writer import prepare_session_writer_root
 
 
 MINIMUM_START_GUARD_NS = 100_000_000
@@ -745,7 +746,6 @@ def formal_window_complete(*, now_ns, start_ns, duration_s, stop_record):
 def setup_storage(session: Path, *, writer_factory=AppendOnlySessionWriter):
     ego_directory = Path(session) / "ego"
     try:
-        ego_directory.mkdir(parents=True, exist_ok=True)
         writer = writer_factory(ego_directory)
     except (OSError, RuntimeError) as exc:
         raise StorageIoFailure() from exc
@@ -763,7 +763,7 @@ def _run_claimed(args) -> int:
     except StorageIoFailure as storage_failure:
         ego_directory = args.session / "ego"
         try:
-            ego_directory.mkdir(parents=True, exist_ok=True)
+            ego_directory = prepare_session_writer_root(ego_directory)
             _write_acceptance(
                 ego_directory / "acceptance.json",
                 build_acceptance(
