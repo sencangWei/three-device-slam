@@ -141,7 +141,11 @@ def test_missing_tool_has_stable_classification(script):
 @pytest.mark.parametrize(
     ("script_name", "preflight", "missing_tools"),
     [
-        ("install_ubuntu.sh", "require_installer_tools", ("awk", "cc", "mkdir", "rm")),
+        (
+            "install_ubuntu.sh",
+            "require_installer_tools",
+            ("awk", "cc", "mkdir", "rm", "chown"),
+        ),
         ("verify_ubuntu_environment.sh", "require_verifier_tools", ("awk",)),
     ],
 )
@@ -151,7 +155,7 @@ def test_real_script_preflight_classifies_each_missing_tool(
     required = {
         "install_ubuntu.sh": (
             "python3", "dirname", "install", "make", "sha256sum", "awk", "file",
-            "grep", "nm", "stat", "readlink", "chmod", "mktemp", "mv", "rm",
+            "grep", "nm", "stat", "readlink", "chmod", "chown", "mktemp", "mv", "rm",
             "sync", "find", "sort", "id", "cc", "mkdir", "flock",
         ),
         "verify_ubuntu_environment.sh": (
@@ -596,12 +600,14 @@ def test_new_venv_is_first_published_by_rename_after_validation(tmp_path):
 source "{script}"
 python3() {{
   local target="${{@: -1}}"
-  mkdir -p "$target/bin"
+  mkdir -p "$target/bin" "$target/lib"
   printf '#!/bin/bash\n' >"$target/bin/python"
+  printf home >"$target/pyvenv.cfg"
   chmod 0755 "$target/bin/python"
 }}
 require_trusted_tree() {{ echo validate >>"{trace}"; }}
 require_trusted_file() {{ :; }}
+chown() {{ :; }}
 sync() {{ :; }}
 create_new_venv "{install_root}"
 '''
@@ -609,7 +615,11 @@ create_new_venv "{install_root}"
 
     assert result.returncode == 0, result.stderr
     assert (install_root / "venv" / "bin" / "python").is_file()
-    assert trace.read_text(encoding="utf-8").splitlines() == ["validate", "validate"]
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        "validate",
+        "validate",
+        "validate",
+    ]
     assert list(install_root.glob(".venv.*.tmp")) == []
 
 
@@ -638,6 +648,7 @@ ensure_venv "{install_root}"
 def test_replaced_temporary_venv_is_neither_published_nor_deleted(tmp_path):
     install_root = tmp_path / "install"
     install_root.mkdir()
+    mutation_log = tmp_path / "mutation-log"
     script = ROOT / "scripts" / "install_ubuntu.sh"
     shell = f'''
 source "{script}"
@@ -648,6 +659,8 @@ python3() {{
   rm -rf -- "$target"
   mv "${{target}}.replacement" "$target"
 }}
+chown() {{ echo chown >>"{mutation_log}"; }}
+chmod() {{ echo chmod >>"{mutation_log}"; }}
 require_trusted_tree() {{ :; }}
 sync() {{ :; }}
 create_new_venv "{install_root}"
@@ -660,3 +673,134 @@ create_new_venv "{install_root}"
     assert not (install_root / "venv").exists()
     assert len(replacements) == 1
     assert (replacements[0] / "marker").read_text(encoding="utf-8") == "replacement"
+    assert not mutation_log.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX Python isolation")
+def test_create_new_venv_ignores_hostile_cwd_and_pythonpath(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    sentinel = tmp_path / "sentinel"
+    (hostile / "venv.py").write_text(
+        f'from pathlib import Path\nPath({str(sentinel)!r}).write_text("executed")\n',
+        encoding="utf-8",
+    )
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    arguments = tmp_path / "python-arguments"
+    wrapper = wrapper_dir / "python3"
+    wrapper.write_text(
+        '#!/bin/bash\nprintf \'%s\\n\' "$@" >"$PYTHON_ARGUMENTS"\n'
+        'exec /usr/bin/python3 "$@" --without-pip\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+chown() {{ :; }}
+require_trusted_tree() {{ :; }}
+sync() {{ :; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        cwd=hostile,
+        env={
+            **os.environ,
+            "PATH": f"{wrapper_dir}:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONPATH": str(hostile),
+            "PYTHON_ARGUMENTS": str(arguments),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not sentinel.exists()
+    args = arguments.read_text(encoding="utf-8").splitlines()
+    assert args[:4] == ["-I", "-B", "-m", "venv"]
+    assert "--system-site-packages" in args
+    subprocess.run(
+        [str(install_root / "venv" / "bin" / "python"), "-I", "-B", "-c", "import json"],
+        check=True,
+        cwd=hostile,
+        env={**os.environ, "PYTHONPATH": str(hostile)},
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode behavior")
+def test_published_venv_has_nonowner_runtime_permissions_without_broad_read(tmp_path):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    chown_log = tmp_path / "chown-log"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+python3() {{
+  local target="${{@: -1}}"
+  mkdir -m 0700 "$target/bin" "$target/lib"
+  printf '#!/bin/bash\nexit 0\n' >"$target/bin/python"
+  printf home >"$target/pyvenv.cfg"
+  printf private >"$target/private-data"
+  chmod 0700 "$target/bin/python"
+  chmod 0600 "$target/pyvenv.cfg" "$target/private-data"
+}}
+chown() {{ printf '%s\n' "$*" >>"{chown_log}"; }}
+require_trusted_tree() {{ :; }}
+sync() {{ :; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    venv = install_root / "venv"
+    assert stat.S_IMODE(venv.stat().st_mode) == 0o755
+    assert stat.S_IMODE((venv / "bin").stat().st_mode) == 0o755
+    assert stat.S_IMODE((venv / "lib").stat().st_mode) == 0o755
+    assert stat.S_IMODE((venv / "bin" / "python").stat().st_mode) == 0o755
+    assert stat.S_IMODE((venv / "pyvenv.cfg").stat().st_mode) == 0o644
+    assert stat.S_IMODE((venv / "private-data").stat().st_mode) == 0o600
+    chown_lines = chown_log.read_text(encoding="utf-8").splitlines()
+    assert len(chown_lines) == 1
+    assert chown_lines[0].startswith("-R root:root ")
+    assert "/.venv." in chown_lines[0] and chown_lines[0].endswith(".tmp")
+    for path in (venv, venv / "bin", venv / "bin" / "python"):
+        assert stat.S_IMODE(path.stat().st_mode) & 0o005 == 0o005
+    assert stat.S_IMODE((venv / "pyvenv.cfg").stat().st_mode) & 0o004
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+@pytest.mark.parametrize("failure_command", ["chown", "chmod"])
+def test_venv_owner_or_mode_adjustment_failure_cleans_without_publish(
+    tmp_path, failure_command
+):
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    chown_function = "chown() { return 1; }" if failure_command == "chown" else "chown() { :; }"
+    chmod_function = (
+        "chmod() { return 1; }"
+        if failure_command == "chmod"
+        else "chmod() { command chmod \"$@\"; }"
+    )
+    shell = f'''
+source "{script}"
+python3() {{
+  local target="${{@: -1}}"
+  mkdir "$target/bin" "$target/lib"
+  printf '#!/bin/bash\n' >"$target/bin/python"
+  printf home >"$target/pyvenv.cfg"
+}}
+{chown_function}
+{chmod_function}
+require_trusted_tree() {{ :; }}
+create_new_venv "{install_root}"
+'''
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert not (install_root / "venv").exists()
+    assert list(install_root.glob(".venv.*.tmp")) == []

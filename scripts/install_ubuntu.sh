@@ -12,7 +12,7 @@ require_tools() {
 
 require_installer_tools() {
   require_tools python3 dirname install make sha256sum awk file grep nm stat readlink \
-    chmod mktemp mv rm sync find sort id cc mkdir flock
+    chmod chown mktemp mv rm sync find sort id cc mkdir flock
 }
 
 require_trusted_path() {
@@ -207,6 +207,35 @@ cleanup_temporary_venv() {
   temporary_venv_identity=
 }
 
+prepare_new_venv_permissions() {
+  local venv=$temporary_venv
+  temporary_venv_is_original || fail "FAIL/untrusted_installation"
+  [[ -d ${venv}/bin && ! -L ${venv}/bin && -d ${venv}/lib && ! -L ${venv}/lib \
+      && -f ${venv}/bin/python && ! -L ${venv}/bin/python \
+      && -f ${venv}/pyvenv.cfg && ! -L ${venv}/pyvenv.cfg ]] || {
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  }
+  if ! chown -R root:root "$venv"; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  if ! temporary_venv_is_original; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  if ! chmod -R go-w "$venv" \
+      || ! chmod 0755 "$venv" "$venv/bin" "$venv/lib" "$venv/bin/python" \
+      || ! chmod 0644 "$venv/pyvenv.cfg"; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  if ! temporary_venv_is_original; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+}
+
 create_new_venv() {
   local install_root=$1 final_venv="${1}/venv"
   temporary_venv_parent=$(readlink -f -- "$install_root") \
@@ -216,7 +245,11 @@ create_new_venv() {
     || fail "FAIL/untrusted_installation"
   temporary_venv_identity=$(stat -c '%d:%i' -- "$temporary_venv") \
     || fail "FAIL/untrusted_installation"
-  if ! python3 -m venv --copies --system-site-packages "$temporary_venv"; then
+  if ! (
+    unset PYTHONHOME PYTHONPATH
+    cd /
+    python3 -I -B -m venv --system-site-packages --copies "$temporary_venv"
+  ); then
     cleanup_temporary_venv
     fail "FAIL/venv_creation"
   fi
@@ -224,8 +257,12 @@ create_new_venv() {
     cleanup_temporary_venv
     fail "FAIL/untrusted_installation"
   fi
-  chmod -R go-w "$temporary_venv"
   normalize_venv_path "$temporary_venv"
+  if ! (require_trusted_tree "$temporary_venv") 2>/dev/null; then
+    cleanup_temporary_venv
+    fail "FAIL/untrusted_installation"
+  fi
+  prepare_new_venv_permissions
   if ! (require_trusted_tree "$temporary_venv") 2>/dev/null; then
     cleanup_temporary_venv
     fail "FAIL/untrusted_installation"
