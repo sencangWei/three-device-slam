@@ -97,6 +97,29 @@ def test_writer_rejects_reopening_sealed_session_without_mutation(tmp_path):
 
     assert payload_path.read_bytes() == payload_before
     assert manifest_path.read_bytes() == manifest_before
+    assert not (root / ".writer.lock").exists()
+
+
+def test_only_one_writer_can_claim_an_unsealed_session(tmp_path):
+    root = tmp_path / "session"
+    first = AppendOnlySessionWriter(root)
+
+    with pytest.raises(RuntimeError, match="active writer"):
+        AppendOnlySessionWriter(root)
+
+    first.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"a",
+    )
+    manifest = first.close()
+    payload = (root / "ego.video.bin").read_bytes()
+
+    assert payload == b"a"
+    assert json.loads((root / "manifest.json").read_bytes()) == manifest
+    assert manifest["streams"]["ego.video"]["payload_sha256"] == hashlib.sha256(
+        payload
+    ).hexdigest()
+    assert not (root / ".writer.lock").exists()
 
 
 @pytest.mark.parametrize("stream_id", ["../escape", "ego/video", "ego\\video", "ego:video", "CON"])
@@ -111,7 +134,7 @@ def test_writer_rejects_unsafe_stream_id_before_writing(tmp_path, stream_id):
         )
 
     assert not (tmp_path / "escape.bin").exists()
-    assert list(root.iterdir()) == []
+    assert [path.name for path in root.iterdir()] == [".writer.lock"]
 
 
 def test_invalid_metadata_leaves_existing_stream_files_unchanged(tmp_path):
@@ -153,3 +176,23 @@ def test_close_fsyncs_session_directory_after_manifest_replace(tmp_path, monkeyp
     writer.close()
 
     assert fsynced_after_replace, "manifest replace must be followed by directory fsync"
+
+
+def test_close_failure_releases_writer_claim(tmp_path, monkeypatch):
+    writer = AppendOnlySessionWriter(tmp_path)
+    writer.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"raw",
+    )
+
+    def fail_replace(*_args):
+        raise OSError("simulated manifest publish failure")
+
+    monkeypatch.setattr(
+        "three_device_slam.core.session_writer.os.replace", fail_replace
+    )
+
+    with pytest.raises(OSError, match="simulated manifest publish failure"):
+        writer.close()
+
+    assert not (tmp_path / ".writer.lock").exists()

@@ -22,10 +22,30 @@ class AppendOnlySessionWriter:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        if (self.root / "manifest.json").exists():
-            raise RuntimeError("session is sealed")
-        self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}
-        self._manifest: dict | None = None
+        self._claim_path = self.root / ".writer.lock"
+        self._claim_owned = False
+        try:
+            descriptor = os.open(
+                self._claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+            )
+        except FileExistsError as error:
+            raise RuntimeError("session already has an active writer") from error
+        self._claim_owned = True
+        try:
+            os.close(descriptor)
+            descriptor = None
+            if (self.root / "manifest.json").exists():
+                raise RuntimeError("session is sealed")
+            self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}
+            self._manifest: dict | None = None
+        except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self._release_claim()
+            raise
 
     def append(
         self, record: SensorRecord, payload: bytes | bytearray | memoryview
@@ -59,32 +79,41 @@ class AppendOnlySessionWriter:
         if self._manifest is not None:
             return self._manifest
 
-        streams = {}
-        for stream_id, (payload_file, index_file) in self._streams.items():
-            for file in (payload_file, index_file):
+        try:
+            streams = {}
+            for stream_id, (payload_file, index_file) in self._streams.items():
+                for file in (payload_file, index_file):
+                    file.flush()
+                    os.fsync(file.fileno())
+                    file.close()
+                streams[stream_id] = {
+                    "payload_sha256": self._sha256(self.root / f"{stream_id}.bin"),
+                    "index_sha256": self._sha256(self.root / f"{stream_id}.jsonl"),
+                }
+            self._manifest = {
+                "schema": "ego.three_device.raw_session.v1",
+                "streams": streams,
+            }
+            temporary = self.root / "manifest.json.tmp"
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(self._manifest, file, sort_keys=True)
                 file.flush()
                 os.fsync(file.fileno())
-                file.close()
-            streams[stream_id] = {
-                "payload_sha256": self._sha256(self.root / f"{stream_id}.bin"),
-                "index_sha256": self._sha256(self.root / f"{stream_id}.jsonl"),
-            }
-        self._manifest = {
-            "schema": "ego.three_device.raw_session.v1",
-            "streams": streams,
-        }
-        temporary = self.root / "manifest.json.tmp"
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(self._manifest, file, sort_keys=True)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, self.root / "manifest.json")
-        directory = os.open(self.root, os.O_RDONLY)
-        try:
-            os.fsync(directory)
+            os.replace(temporary, self.root / "manifest.json")
+            directory = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return self._manifest
         finally:
-            os.close(directory)
-        return self._manifest
+            self._release_claim()
+
+    def _release_claim(self) -> None:
+        if not self._claim_owned:
+            return
+        self._claim_path.unlink()
+        self._claim_owned = False
 
     @staticmethod
     def _sha256(path: Path) -> str:
