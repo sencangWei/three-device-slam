@@ -314,16 +314,16 @@ def build_acceptance(
     measured_formal_duration_s: float | None = None,
     formal_start_ns: int | None = None,
     formal_deadline_ns: int | None = None,
+    formal_end_ns: int | None = None,
 ) -> dict:
     qualification = dict(formal_stats or {})
     formal_measurements_available = int(qualification.get("observed_frames", 0)) > 0
-    window_rate_hz = (
-        int(qualification.get("valid_frames", 0)) / requested_duration_s
-        if formal_measurements_available
-        and requested_duration_s is not None
-        and requested_duration_s > 0
-        else None
-    )
+    if not formal_measurements_available:
+        window_rate_hz = None
+    elif requested_duration_s is not None and requested_duration_s > 0:
+        window_rate_hz = int(qualification.get("valid_frames", 0)) / requested_duration_s
+    else:
+        window_rate_hz = qualification.get("rate_hz")
     qualification["window_rate_hz"] = window_rate_hz
     if failure is not None:
         forced_status = failure.status
@@ -408,10 +408,13 @@ def build_acceptance(
         if formal_measurements_available
         else None
     )
+    formal_end_boundary_ns = (
+        formal_deadline_ns if formal_deadline_ns is not None else formal_end_ns
+    )
     end_covered = (
         last_formal_ns is not None
-        and formal_deadline_ns is not None
-        and last_formal_ns >= formal_deadline_ns - FORMAL_EDGE_LAG_NS
+        and formal_end_boundary_ns is not None
+        and last_formal_ns >= formal_end_boundary_ns - FORMAL_EDGE_LAG_NS
     )
     checks["formal_end_coverage"] = {
         "status": (
@@ -423,7 +426,10 @@ def build_acceptance(
             if end_covered
             else "FAIL"
         ),
-        "threshold": f"last comparable frame within {FORMAL_EDGE_LAG_NS} ns of deadline",
+        "threshold": (
+            f"last comparable frame within {FORMAL_EDGE_LAG_NS} ns of "
+            f"{'deadline' if formal_deadline_ns is not None else 'stop'}"
+        ),
         "measurement": last_formal_ns,
         "scope": "formal_window",
     }
@@ -696,6 +702,7 @@ def run_formal_window(
     recorder=None,
 ) -> int:
     while True:
+        _check_capture_terminal(capture, recorder)
         now_ns = clock_ns()
         try:
             stop_record = barrier.read_stop()
@@ -708,7 +715,6 @@ def run_formal_window(
             stop_record=stop_record,
         ):
             return now_ns
-        _check_capture_terminal(capture, recorder)
         if on_poll is not None:
             on_poll(now_ns)
         sleep(0.02)
@@ -872,6 +878,7 @@ def run(args) -> int:
         ),
         formal_start_ns=start_ns,
         formal_deadline_ns=deadline_ns,
+        formal_end_ns=formal_end_ns,
     )
     try:
         _write_acceptance(ego_directory / "acceptance.json", report)

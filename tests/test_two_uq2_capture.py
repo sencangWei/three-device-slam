@@ -4,9 +4,12 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from three_device_slam.core import AppendOnlySessionWriter, SensorRecord
+from three_device_slam.devices.two_uq2 import worker as two_uq2_worker
 from three_device_slam.devices.two_uq2.capture import (
     CaptureRuntimeError,
     DeviceUnavailableError,
@@ -556,6 +559,11 @@ class HealthyCapture:
         return None
 
 
+class StorageFailedRecorder:
+    def raise_if_storage_failed(self):
+        raise StorageIoFailure()
+
+
 class StopBarrier:
     def __init__(self, stop_record):
         self.stop_record = stop_record
@@ -686,6 +694,273 @@ def test_formal_window_returns_normally_at_duration_after_reading_stop():
 
     assert end_ns == 3_500_000_000
     assert barrier.reads == 1
+
+
+def test_barrier_stop_does_not_mask_capture_terminal_failure():
+    barrier = StopBarrier(
+        {"at_ns": 1_000_000_000, "reason": "operator_interrupt"}
+    )
+    with pytest.raises(CaptureRuntimeFailure, match="gstreamer_error"):
+        run_formal_window(
+            TerminalCapture(),
+            barrier=barrier,
+            start_ns=1_000_000_000,
+            duration_s=None,
+            clock_ns=lambda: 1_000_000_001,
+            sleep=lambda _seconds: None,
+        )
+    assert barrier.reads == 0
+
+
+def test_duration_completion_does_not_mask_capture_terminal_failure():
+    barrier = StopBarrier(None)
+    with pytest.raises(CaptureRuntimeFailure, match="gstreamer_error"):
+        run_formal_window(
+            TerminalCapture(),
+            barrier=barrier,
+            start_ns=1_000_000_000,
+            duration_s=1.0,
+            clock_ns=lambda: 2_000_000_000,
+            sleep=lambda _seconds: None,
+        )
+    assert barrier.reads == 0
+
+
+def test_barrier_stop_does_not_mask_storage_failure():
+    barrier = StopBarrier(
+        {"at_ns": 1_000_000_000, "reason": "operator_interrupt"}
+    )
+    with pytest.raises(StorageIoFailure, match="storage_io"):
+        run_formal_window(
+            HealthyCapture(),
+            barrier=barrier,
+            start_ns=1_000_000_000,
+            duration_s=None,
+            recorder=StorageFailedRecorder(),
+            clock_ns=lambda: 1_000_000_001,
+            sleep=lambda _seconds: None,
+        )
+    assert barrier.reads == 0
+
+
+def test_duration_completion_does_not_mask_storage_failure():
+    barrier = StopBarrier(None)
+    with pytest.raises(StorageIoFailure, match="storage_io"):
+        run_formal_window(
+            HealthyCapture(),
+            barrier=barrier,
+            start_ns=1_000_000_000,
+            duration_s=1.0,
+            recorder=StorageFailedRecorder(),
+            clock_ns=lambda: 2_000_000_000,
+            sleep=lambda _seconds: None,
+        )
+    assert barrier.reads == 0
+
+
+def test_storage_failure_precedes_capture_terminal_failure():
+    barrier = StopBarrier(
+        {"at_ns": 1_000_000_000, "reason": "operator_interrupt"}
+    )
+    with pytest.raises(StorageIoFailure, match="storage_io"):
+        run_formal_window(
+            TerminalCapture(),
+            barrier=barrier,
+            start_ns=1_000_000_000,
+            duration_s=None,
+            recorder=StorageFailedRecorder(),
+            clock_ns=lambda: 1_000_000_001,
+            sleep=lambda _seconds: None,
+        )
+    assert barrier.reads == 0
+
+
+def install_run_fakes(
+    tmp_path,
+    monkeypatch,
+    *,
+    completion,
+    duration_s,
+    seal_failure=False,
+):
+    start_ns = 1_000_000_000
+    end_ns = 2_000_000_000
+    payload = b"encoded-2uq2-raw"
+    events = []
+    ego_directory = tmp_path / "session" / "ego"
+
+    class EventWriter:
+        def __init__(self):
+            self.writer = AppendOnlySessionWriter(ego_directory)
+
+        def append(self, record, raw):
+            return self.writer.append(record, raw)
+
+        def close(self):
+            manifest = self.writer.close()
+            if seal_failure:
+                events.append("writer.seal_failure")
+                raise OSError("seal failed")
+            events.append("writer.sealed")
+            return manifest
+
+    writer = EventWriter()
+
+    class RunRecorder:
+        def __init__(self, recorder_writer):
+            assert recorder_writer is writer
+            recorder_writer.append(
+                SensorRecord(
+                    "ego.video",
+                    0,
+                    start_ns,
+                    start_ns,
+                    "gstreamer_monotonic",
+                    False,
+                    True,
+                    {"task_start_candidate": True},
+                ),
+                payload,
+            )
+
+        def handle(self, _frame):
+            raise AssertionError("fake capture must not emit frames")
+
+        def formal_stats(self):
+            return formal_evidence(
+                first_ns=start_ns,
+                last_ns=end_ns,
+                total_frames=60,
+                valid_frames=60,
+                rate_hz=60.0,
+            )
+
+        def counts(self):
+            return {"warmup_frames": 0, "formal_frames": 60}
+
+    class RunCapture:
+        def start(self):
+            events.append("capture.start")
+
+        def stop(self):
+            events.append("capture.stop")
+
+        def stats(self):
+            return {
+                "frames": 60,
+                "callback_exceptions": 0,
+                "capture_errors": 0,
+            }
+
+    class RunBarrier:
+        def latch_failure(self, _device_id, reason, _at_ns):
+            events.append(f"barrier.failure:{reason}")
+
+    capture = RunCapture()
+    barrier = RunBarrier()
+    original_write_acceptance = two_uq2_worker._write_acceptance
+
+    def observe_acceptance(path, report):
+        manifest_path = ego_directory / "manifest.json"
+        assert manifest_path.is_file()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert (ego_directory / "ego.video.bin").read_bytes() == payload
+        assert not path.exists()
+        if not seal_failure:
+            assert events[-1] == "writer.sealed"
+            assert report["hashes"]["streams"] == manifest["streams"]
+        events.append("acceptance.publish")
+        original_write_acceptance(path, report)
+
+    monkeypatch.setattr(
+        two_uq2_worker,
+        "setup_storage",
+        lambda _session: (ego_directory, writer),
+    )
+    monkeypatch.setattr(two_uq2_worker, "BarrierDirectory", lambda _path: barrier)
+    monkeypatch.setattr(two_uq2_worker, "EgoFrameRecorder", RunRecorder)
+    monkeypatch.setattr(
+        two_uq2_worker,
+        "TwoUQ2Capture",
+        lambda _device, _library, _on_frame: capture,
+    )
+    monkeypatch.setattr(
+        two_uq2_worker,
+        "wait_for_scheduled_start",
+        lambda *_args, **_kwargs: events.append("barrier.start") or start_ns,
+    )
+    monkeypatch.setattr(
+        two_uq2_worker,
+        "run_formal_window",
+        lambda *_args, **_kwargs: events.append(f"formal.{completion}") or end_ns,
+    )
+    monkeypatch.setattr(two_uq2_worker, "_evidence", lambda _path: {"python": "3.test"})
+    monkeypatch.setattr(two_uq2_worker, "_write_acceptance", observe_acceptance)
+
+    args = SimpleNamespace(
+        session=tmp_path / "session",
+        barrier_dir=tmp_path / "session" / "barrier",
+        device="/dev/video0",
+        xu_library="/tmp/libtwo_uq2_xu.so",
+        duration=duration_s,
+    )
+    return args, events, ego_directory
+
+
+@pytest.mark.parametrize(
+    ("completion", "duration_s"),
+    [("barrier_stop", None), ("duration", 1.0)],
+)
+def test_run_graceful_completion_seals_raw_before_publishing_pass_acceptance(
+    tmp_path,
+    monkeypatch,
+    completion,
+    duration_s,
+):
+    args, events, ego_directory = install_run_fakes(
+        tmp_path,
+        monkeypatch,
+        completion=completion,
+        duration_s=duration_s,
+    )
+
+    assert two_uq2_worker.run(args) == 0
+
+    assert events == [
+        "capture.start",
+        "barrier.start",
+        f"formal.{completion}",
+        "capture.stop",
+        "writer.sealed",
+        "acceptance.publish",
+    ]
+    report = json.loads(
+        (ego_directory / "acceptance.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "PASS"
+
+
+def test_run_seal_failure_publishes_fail_not_false_pass(tmp_path, monkeypatch):
+    args, events, ego_directory = install_run_fakes(
+        tmp_path,
+        monkeypatch,
+        completion="duration",
+        duration_s=1.0,
+        seal_failure=True,
+    )
+
+    assert two_uq2_worker.run(args) == 2
+
+    report = json.loads(
+        (ego_directory / "acceptance.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "storage_io"
+    assert events[-3:] == [
+        "writer.seal_failure",
+        "acceptance.publish",
+        "barrier.failure:storage_io",
+    ]
 
 
 def test_standalone_start_is_scheduled_in_future_for_raw_warmup():
