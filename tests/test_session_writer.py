@@ -79,6 +79,26 @@ def test_writer_rejects_append_after_close(tmp_path):
         raise AssertionError("append after close was accepted")
 
 
+def test_writer_rejects_reopening_sealed_session_without_mutation(tmp_path):
+    root = tmp_path / "session"
+    writer = AppendOnlySessionWriter(root)
+    writer.append(
+        SensorRecord("ego.video", 1, 1, 1, "host_monotonic", False, True, {}),
+        b"raw",
+    )
+    writer.close()
+    payload_path = root / "ego.video.bin"
+    manifest_path = root / "manifest.json"
+    payload_before = payload_path.read_bytes()
+    manifest_before = manifest_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        AppendOnlySessionWriter(root)
+
+    assert payload_path.read_bytes() == payload_before
+    assert manifest_path.read_bytes() == manifest_before
+
+
 @pytest.mark.parametrize("stream_id", ["../escape", "ego/video", "ego\\video", "ego:video", "CON"])
 def test_writer_rejects_unsafe_stream_id_before_writing(tmp_path, stream_id):
     root = tmp_path / "session"

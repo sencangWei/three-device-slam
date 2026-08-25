@@ -22,6 +22,8 @@ class AppendOnlySessionWriter:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        if (self.root / "manifest.json").exists():
+            raise RuntimeError("session is sealed")
         self._streams: dict[str, tuple[BinaryIO, BinaryIO]] = {}
         self._manifest: dict | None = None
 
