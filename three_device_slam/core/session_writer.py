@@ -25,7 +25,7 @@ _RESERVED_STREAM_IDS = {"CON", "PRN", "AUX", "NUL"} | {
 
 class AppendOnlySessionWriter:
     def __init__(self, root: Path):
-        self.root, created_identity = _prepare_writer_root(root)
+        self.root = _prepare_writer_root(root)
         self._claim_path = self.root / ".writer.lock"
         self._claim_owned = False
         try:
@@ -34,9 +34,6 @@ class AppendOnlySessionWriter:
             )
         except FileExistsError as error:
             raise RuntimeError("session already has an active writer") from error
-        except BaseException:
-            _remove_created_writer_root(self.root, created_identity)
-            raise
         self._claim_owned = True
         try:
             os.close(descriptor)
@@ -54,7 +51,6 @@ class AppendOnlySessionWriter:
                 except OSError:
                     pass
             self._release_claim_best_effort()
-            _remove_created_writer_root(self.root, created_identity)
             raise
 
     def append(
@@ -184,11 +180,10 @@ class AppendOnlySessionWriter:
 
 
 def prepare_session_writer_root(root: Path) -> Path:
-    prepared, _created_identity = _prepare_writer_root(root)
-    return prepared
+    return _prepare_writer_root(root)
 
 
-def _prepare_writer_root(root: Path) -> tuple[Path, tuple[int, int] | None]:
+def _prepare_writer_root(root: Path) -> Path:
     requested = Path(root)
     name = requested.name
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
@@ -202,34 +197,8 @@ def _prepare_writer_root(root: Path) -> tuple[Path, tuple[int, int] | None]:
     existing = assert_safe_path(
         absolute, parent, "writer root", kind="directory"
     )
-    created_identity = None
     if existing is None:
         absolute.mkdir(parents=False)
-        created_identity = _directory_identity(absolute.lstat())
-    try:
-        assert_safe_path(absolute, parent, "writer root", kind="directory")
-        assert_session_open_for_producers(parent)
-    except BaseException:
-        _remove_created_writer_root(absolute, created_identity)
-        raise
-    return absolute, created_identity
-
-
-def _remove_created_writer_root(
-    root: Path, expected_identity: tuple[int, int] | None
-) -> None:
-    if expected_identity is None:
-        return
-    try:
-        info = assert_safe_path(root, root.parent, "writer root", kind="directory")
-        if info is None or _directory_identity(info) != expected_identity:
-            return
-        if any(root.iterdir()):
-            return
-        root.rmdir()
-    except BaseException:
-        pass
-
-
-def _directory_identity(info) -> tuple[int, int]:
-    return info.st_dev, info.st_ino
+    assert_safe_path(absolute, parent, "writer root", kind="directory")
+    assert_session_open_for_producers(parent)
+    return absolute

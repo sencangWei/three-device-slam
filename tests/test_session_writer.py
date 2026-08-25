@@ -454,7 +454,7 @@ def test_claim_creation_fsync_failure_removes_new_claim(tmp_path, monkeypatch):
     assert not (session / ".producer.ego.lock").exists()
 
 
-def test_writer_root_creation_race_removes_only_its_empty_directory(
+def test_writer_root_creation_race_preserves_empty_directory_without_business_files(
     tmp_path, monkeypatch
 ):
     session = tmp_path / "session"
@@ -473,7 +473,40 @@ def test_writer_root_creation_race_removes_only_its_empty_directory(
     with pytest.raises(RuntimeError, match="offline"):
         AppendOnlySessionWriter(writer_root)
 
-    assert not writer_root.exists()
+    assert writer_root.is_dir()
+    assert list(writer_root.iterdir()) == []
+
+
+def test_writer_root_replacement_between_mkdir_and_identity_read_is_never_removed(
+    tmp_path, monkeypatch
+):
+    session = tmp_path / "session"
+    session.mkdir()
+    writer_root = session / "capture"
+    moved_original = session / "capture-created-by-writer"
+    original_mkdir = Path.mkdir
+
+    def replace_root_before_mkdir_returns(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        if path == writer_root:
+            path.rename(moved_original)
+            original_mkdir(path)
+            (session / ".offline.lock").write_bytes(b"")
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", replace_root_before_mkdir_returns)
+
+    with pytest.raises(RuntimeError, match="offline"):
+        AppendOnlySessionWriter(writer_root)
+
+    assert writer_root.is_dir()
+    assert moved_original.is_dir()
+    for directory in (writer_root, moved_original):
+        assert list(directory.iterdir()) == []
+        assert not (directory / ".writer.lock").exists()
+        assert not (directory / "manifest.json").exists()
+        assert not list(directory.glob("*.bin"))
+        assert not list(directory.glob("*.jsonl"))
 
 
 def test_writer_root_creation_race_preserves_nonempty_directory(
