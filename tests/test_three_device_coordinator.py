@@ -15,11 +15,14 @@ DEVICES = ("ego", "left", "right")
 
 
 class FakeClock:
-    def __init__(self, tick_on_call_ns=0):
+    def __init__(self, tick_on_call_ns=0, fail_after_ns=None):
         self.now_ns = 0
         self.tick_on_call_ns = tick_on_call_ns
+        self.fail_after_ns = fail_after_ns
 
     def __call__(self):
+        if self.fail_after_ns is not None and self.now_ns > self.fail_after_ns:
+            raise RuntimeError("coordinator exceeded controlled time")
         now_ns = self.now_ns
         self.now_ns += self.tick_on_call_ns
         return now_ns
@@ -33,7 +36,9 @@ class FakeProcess:
         self.device_id = device_id
         self.barrier = barrier
         self.clock = clock
-        self.duration_ns = int(duration_s * 1_000_000_000)
+        self.duration_ns = (
+            None if duration_s is None else int(duration_s * 1_000_000_000)
+        )
         self.behavior = behavior
         self.returncode = None
         self.terminate_called = False
@@ -52,6 +57,16 @@ class FakeProcess:
         start_ns = self.barrier.read_start_ns()
         self.start_observations.append((now_ns, start_ns))
         self._poll_count += 1
+
+        if (
+            start_ns is not None
+            and self.behavior.get("exit_on_stop", False)
+            and self.barrier.read_stop() is not None
+        ):
+            self.returncode = self.behavior.get("exit_code", 0)
+            self.finalized_naturally = True
+            self._write_acceptance(start_ns)
+            return self.returncode
 
         first_heartbeat_ns = self.behavior.get("first_heartbeat_ns", 0)
         stop_after_start_ns = self.behavior.get("stop_heartbeat_after_start_ns")
@@ -85,10 +100,11 @@ class FakeProcess:
 
         exit_ns = self.behavior.get("exit_ns")
         if start_ns is not None:
-            offset = self.behavior.get(
-                "exit_after_start_ns", self.duration_ns + 50_000_000
-            )
-            exit_ns = start_ns + offset
+            offset = self.behavior.get("exit_after_start_ns")
+            if offset is None and self.duration_ns is not None:
+                offset = self.duration_ns + 50_000_000
+            if offset is not None:
+                exit_ns = start_ns + offset
         if exit_ns is not None and now_ns >= exit_ns:
             failure_reason = self.behavior.get("failure_reason")
             if failure_reason:
@@ -132,7 +148,7 @@ class FakeProcess:
                 "formal_evidence": {
                     "first_acquisition_ns": None if start_ns is None else start_ns + 10
                 },
-                "hashes": {"xu_library_sha256": "ego-xu-evidence"},
+                "hashes": {"xu_library_sha256": "a" * 64},
             }
         else:
             payload = {
@@ -219,6 +235,73 @@ def test_stop_callback_publishes_operator_stop(tmp_path, monkeypatch):
     assert payload["reason"] == "operator_interrupt"
     assert all(process.finalized_naturally for process in processes.values())
     assert report["reason"] == "operator_stop"
+
+
+def test_operator_stop_quick_exit_is_natural_finalization(tmp_path, monkeypatch):
+    _, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=1.0,
+        stop_requested=lambda: True,
+        behaviors={device: {"exit_on_stop": True} for device in DEVICES},
+    )
+
+    assert report["status"] == "PASS"
+    assert report["reason"] == "operator_stop"
+    assert all(process.finalized_naturally for process in processes.values())
+    assert all(not worker["early_exit"] for worker in report["workers"].values())
+
+
+def test_unbounded_worker_exit_publishes_one_failure_stop_and_finishes(
+    tmp_path, monkeypatch
+):
+    calls = []
+    original_request_stop = coordinator.BarrierDirectory.request_stop
+
+    def counted_request_stop(barrier, at_ns, reason):
+        calls.append((at_ns, reason))
+        return original_request_stop(barrier, at_ns, reason)
+
+    monkeypatch.setattr(
+        coordinator.BarrierDirectory, "request_stop", counted_request_stop
+    )
+    session, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        clock=FakeClock(fail_after_ns=10_000_000_000),
+        behaviors={
+            "left": {"exit_after_start_ns": 100_000_000},
+            "ego": {"exit_on_stop": True},
+            "right": {"exit_on_stop": True},
+        },
+    )
+
+    stop = json.loads((session / "barrier" / "stop.json").read_text())
+    assert calls == [(report["first_error"]["at_ns"], "worker_failure")]
+    assert stop["at_ns"] == report["first_error"]["at_ns"]
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "worker_exit"
+    assert processes["ego"].finalized_naturally
+    assert processes["right"].finalized_naturally
+
+
+def test_failure_stop_timeout_preserves_original_first_error(tmp_path, monkeypatch):
+    _, _, processes, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        duration_s=None,
+        behaviors={
+            "left": {"exit_after_start_ns": 100_000_000},
+            "ego": {"exit_on_stop": True},
+            "right": {},
+        },
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "worker_stop_timeout"
+    assert report["first_error"]["reason"] == "worker_exit"
+    assert processes["right"].terminate_called
 
 
 def test_stop_callback_timeout_terminates_unresponsive_worker(tmp_path, monkeypatch):
@@ -981,6 +1064,97 @@ def test_malformed_nested_acceptance_never_escapes_or_contributes_evidence(
     if device_id == "ego":
         assert report["task_start_ego_frame_ns"] is None
         assert evidence["evidence_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("device_id", "payload"),
+    [
+        ("left", {"result": "PASS", "live_vins": {"imu_calibration": []}}),
+        ("left", {"result": "FAIL", "reason": [], "live_vins": {}}),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": [],
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "FAIL",
+                "reason": [],
+                "formal_evidence": {},
+                "hashes": {},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "formal_evidence": {"first_acquisition_ns": True},
+                "hashes": {},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "formal_evidence": {"first_acquisition_ns": []},
+                "hashes": {},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "formal_evidence": {},
+                "hashes": {"xu_library_sha256": []},
+            },
+        ),
+        (
+            "ego",
+            {
+                "schema": "ego.2uq2.acceptance.v1",
+                "status": "PASS",
+                "formal_evidence": {},
+                "hashes": {"xu_library_sha256": "not-a-sha256"},
+            },
+        ),
+    ],
+    ids=(
+        "d405-calibration-list",
+        "d405-reason-list",
+        "ego-status-list",
+        "ego-reason-list",
+        "ego-timestamp-bool",
+        "ego-timestamp-list",
+        "ego-hash-list",
+        "ego-hash-domain",
+    ),
+)
+def test_invalid_acceptance_leaf_is_fail_closed(
+    tmp_path, monkeypatch, device_id, payload
+):
+    session, _, _, _, report = run_fake_session(
+        tmp_path,
+        monkeypatch,
+        behaviors={device_id: {"acceptance_payload": payload}},
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["reason"] == "worker_acceptance_invalid"
+    assert report["first_error"]["device_id"] == device_id
+    assert json.loads((session / "coordinator.json").read_text()) == report
+    evidence = report["calibration_evidence_ids"][device_id]
+    assert evidence["available"] is False
+    if device_id == "ego":
+        assert report["task_start_ego_frame_ns"] is None
 
 
 def test_cli_builds_current_session_root_worker_contract(tmp_path, monkeypatch):

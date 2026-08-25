@@ -8,6 +8,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -86,7 +87,8 @@ def run_coordinator(
     post_confirmation_ns = None
     prompted = False
     prestart_terminal = False
-    operator_stop_ns = None
+    stop_boundary_ns = None
+    operator_stop_published = False
 
     def add_transition(state: str, at_ns: int) -> None:
         if transitions[-1]["state"] != state:
@@ -97,6 +99,28 @@ def run_coordinator(
         error = {"reason": reason, "at_ns": at_ns, **details}
         if first_error is None:
             first_error = error
+
+    def publish_stop(at_ns: int, reason: str, alive_devices) -> None:
+        nonlocal stop_boundary_ns, operator_stop_published
+        if stop_boundary_ns is not None:
+            return
+        stop_boundary_ns = at_ns
+        operator_stop_published = reason == "operator_interrupt"
+        for device in alive_devices:
+            worker_results[device][
+                "observed_running_at_or_after_formal_end"
+            ] = True
+        try:
+            barrier.request_stop(at_ns, reason)
+        except (OSError, ValueError) as exc:
+            coordinator_errors.append(
+                {
+                    "reason": "barrier_io",
+                    "at_ns": at_ns,
+                    "detail": type(exc).__name__,
+                }
+            )
+            latch_error("barrier_io", at_ns)
 
     try:
         for device in REQUIRED_DEVICES:
@@ -112,15 +136,18 @@ def run_coordinator(
     while processes and not prestart_terminal:
         now_ns = clock_ns()
         formal_end_ns = (
-            operator_stop_ns
-            if operator_stop_ns is not None
+            stop_boundary_ns
+            if stop_boundary_ns is not None
             else None
             if scheduled_start_ns is None or duration_s is None
             else scheduled_start_ns + int(duration_s * 1_000_000_000)
         )
         newly_exited = []
+        alive_this_poll = set()
         for device, process in processes.items():
             exit_code = process.poll()
+            if exit_code is None:
+                alive_this_poll.add(device)
             if (
                 exit_code is None
                 and formal_end_ns is not None
@@ -148,6 +175,10 @@ def run_coordinator(
                 latch_error(failure["reason"], failure["at_ns"], device_id=device)
                 if scheduled_start_ns is None:
                     prestart_terminal = True
+                elif stop_boundary_ns is None:
+                    publish_stop(
+                        failure["at_ns"], "worker_failure", alive_this_poll
+                    )
 
         for device, exit_code in newly_exited:
             proof = worker_results[device][
@@ -161,24 +192,20 @@ def run_coordinator(
             }
             if device not in barrier_failures and (early or exit_code != 0):
                 latch_error("worker_exit", now_ns, device_id=device, exit_code=exit_code)
+                if (
+                    scheduled_start_ns is not None
+                    and stop_boundary_ns is None
+                    and (formal_end_ns is None or now_ns < formal_end_ns)
+                ):
+                    publish_stop(now_ns, "worker_failure", alive_this_poll)
             if scheduled_start_ns is None:
                 prestart_terminal = True
 
         if scheduled_start_ns is not None:
-            if operator_stop_ns is None and stop_requested():
-                operator_stop_ns = clock_ns()
-                try:
-                    barrier.request_stop(operator_stop_ns, "operator_interrupt")
-                except (OSError, ValueError) as exc:
-                    coordinator_errors.append(
-                        {
-                            "reason": "barrier_io",
-                            "at_ns": operator_stop_ns,
-                            "detail": type(exc).__name__,
-                        }
-                    )
-                    latch_error("barrier_io", operator_stop_ns)
-                formal_end_ns = operator_stop_ns
+            if stop_boundary_ns is None and stop_requested():
+                publish_stop(now_ns, "operator_interrupt", alive_this_poll)
+            if stop_boundary_ns is not None:
+                formal_end_ns = stop_boundary_ns
             if formal_end_ns is None or now_ns < formal_end_ns:
                 try:
                     recording_heartbeats = barrier.read_heartbeats()
@@ -247,8 +274,11 @@ def run_coordinator(
             ):
                 timeout_reason = (
                     "worker_stop_timeout"
-                    if operator_stop_ns is not None
+                    if stop_boundary_ns is not None
                     else "worker_finalize_timeout"
+                )
+                coordinator_errors.append(
+                    {"reason": timeout_reason, "at_ns": now_ns}
                 )
                 latch_error(timeout_reason, now_ns)
                 for device, process in processes.items():
@@ -530,7 +560,7 @@ def run_coordinator(
         barrier_failures,
         coordinator_errors,
     )
-    if status == "PASS" and operator_stop_ns is not None:
+    if status == "PASS" and operator_stop_published:
         reason = "operator_stop"
     task_start_ns = _task_start_ego_frame_ns(
         trusted_acceptances.get("ego"), scheduled_start_ns
@@ -723,6 +753,17 @@ def _final_status(
         )
     ):
         return "BLOCKED", first_error["reason"]
+    timeout_error = next(
+        (
+            error
+            for error in coordinator_errors
+            if error.get("reason")
+            in {"worker_stop_timeout", "worker_finalize_timeout"}
+        ),
+        None,
+    )
+    if timeout_error is not None:
+        return "FAIL", timeout_error["reason"]
     if coordinator_errors:
         reason = (
             coordinator_errors[0]["reason"]
@@ -797,6 +838,9 @@ def _load_acceptances(session: Path):
 def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
     if not isinstance(acceptance, Mapping):
         return None
+    reason = acceptance.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return None
     if device_id == "ego":
         if acceptance.get("schema") != "ego.2uq2.acceptance.v1":
             return None
@@ -805,14 +849,44 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
             for key in ("formal_evidence", "hashes")
         ):
             return None
+        formal_evidence = acceptance.get("formal_evidence", {})
+        first_acquisition_ns = formal_evidence.get("first_acquisition_ns")
+        if first_acquisition_ns is not None and (
+            isinstance(first_acquisition_ns, bool)
+            or not isinstance(first_acquisition_ns, int)
+            or first_acquisition_ns < 0
+        ):
+            return None
+        hashes = acceptance.get("hashes", {})
+        xu_library_sha256 = hashes.get("xu_library_sha256")
+        if xu_library_sha256 is not None and (
+            not isinstance(xu_library_sha256, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", xu_library_sha256) is None
+        ):
+            return None
+        calibration_id = acceptance.get("calibration_id")
+        if calibration_id is not None and (
+            not isinstance(calibration_id, str) or not calibration_id
+        ):
+            return None
         status = acceptance.get("status")
     else:
         if "live_vins" in acceptance and not isinstance(
             acceptance["live_vins"], Mapping
         ):
             return None
+        live_vins = acceptance.get("live_vins", {})
+        calibration_id = live_vins.get("imu_calibration")
+        if calibration_id is not None and (
+            not isinstance(calibration_id, str) or not calibration_id
+        ):
+            return None
         status = acceptance.get("result")
-    return status if status in {"PASS", "FAIL", "BLOCKED"} else None
+    return (
+        status
+        if isinstance(status, str) and status in {"PASS", "FAIL", "BLOCKED"}
+        else None
+    )
 
 
 def _task_start_ego_frame_ns(acceptance, scheduled_start_ns):
