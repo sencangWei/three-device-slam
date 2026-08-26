@@ -28,6 +28,11 @@ def test_shell_entries_use_absolute_bash_interpreter():
         assert path.read_text(encoding="utf-8").splitlines()[0] == "#!/bin/bash"
 
 
+def test_shell_entries_use_lf_line_endings():
+    for path in SCRIPTS:
+        assert b"\r\n" not in path.read_bytes()
+
+
 def test_launcher_uses_isolated_absolute_installed_python(tmp_path):
     text = (ROOT / "run_three_device_slam.sh").read_text(encoding="utf-8")
     assert "set -euo pipefail" in text
