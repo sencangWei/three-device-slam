@@ -17,4 +17,4 @@ $(TARGET): bridge.c $(VENDOR_LIBRARY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ bridge.c $(VENDOR_LIBRARY)
 
 clean:
-	$(RM) -r build
+	$(RM) -rf -- build

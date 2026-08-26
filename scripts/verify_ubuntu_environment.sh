@@ -3,6 +3,14 @@ set -euo pipefail
 
 fail() { echo "$1" >&2; exit 2; }
 
+source_ros_setup() {
+  local setup=$1
+  set +u
+  # shellcheck disable=SC1090
+  source "$setup"
+  set -u
+}
+
 require_tools() {
   local tool
   for tool in "$@"; do
@@ -219,8 +227,7 @@ main() {
   [[ ${ID} == ubuntu && ${VERSION_ID} == 22.04 ]] || fail "FAIL/unsupported_ubuntu"
   require_verifier_tools
   [[ -r /opt/ros/humble/setup.bash ]] || fail "FAIL/ros_humble_missing"
-  # shellcheck source=/opt/ros/humble/setup.bash
-  source /opt/ros/humble/setup.bash
+  source_ros_setup /opt/ros/humble/setup.bash
   [[ ${ROS_DISTRO:-} == humble ]] || fail "FAIL/ros_humble_missing"
   export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 

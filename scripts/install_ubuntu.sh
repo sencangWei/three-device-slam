@@ -3,6 +3,14 @@ set -euo pipefail
 
 fail() { echo "$1" >&2; exit 2; }
 
+source_ros_setup() {
+  local setup=$1
+  set +u
+  # shellcheck disable=SC1090
+  source "$setup"
+  set -u
+}
+
 require_tools() {
   local tool
   for tool in "$@"; do
@@ -125,7 +133,7 @@ validate_bridge() {
     nm -D --defined-only "$bridge" | grep -Eq "[[:space:]]${symbol}$" \
       || fail "FAIL/xu_bridge_artifact_invalid"
   done
-  sha256sum "$bridge" | awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { ok=1 } END { exit !ok }' \
+  sha256sum "$bridge" | awk 'NF == 2 && length($1) == 64 && $1 !~ /[^0-9a-f]/ { ok=1 } END { exit !ok }' \
     || fail "FAIL/xu_bridge_artifact_invalid"
 }
 
@@ -538,8 +546,7 @@ main() {
   require_installer_tools
   probe_python_venv
   [[ -r /opt/ros/humble/setup.bash ]] || fail "FAIL/ros_humble_missing"
-  # shellcheck source=/opt/ros/humble/setup.bash
-  source /opt/ros/humble/setup.bash
+  source_ros_setup /opt/ros/humble/setup.bash
   [[ ${ROS_DISTRO:-} == humble ]] || fail "FAIL/ros_humble_missing"
   export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 

@@ -122,6 +122,109 @@ def test_environment_verifier_is_read_only_and_checks_frozen_invariants():
         assert write_command not in text
 
 
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+@pytest.mark.parametrize(
+    "script", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+def test_ros_setup_tolerates_unset_ament_trace_and_restores_nounset(
+    tmp_path, script
+):
+    setup = tmp_path / "setup.bash"
+    setup.write_text(
+        ': "${AMENT_TRACE_SETUP_FILES}"\nexport ROS_DISTRO=humble\n',
+        encoding="utf-8",
+    )
+    path = ROOT / "scripts" / script
+    shell = f'''
+source "{path}"
+unset AMENT_TRACE_SETUP_FILES
+source_ros_setup "{setup}"
+[[ $ROS_DISTRO == humble ]]
+case $- in *u*) ;; *) exit 7 ;; esac
+'''
+
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(
+    shutil.which("make") is None or shutil.which("rm") is None,
+    reason="make and rm are required",
+)
+def test_bridge_clean_is_idempotent_with_frozen_installer_rm(tmp_path):
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    shutil.copy(ROOT / "native" / "2uq2_xu_bridge" / "Makefile", bridge)
+
+    result = subprocess.run(
+        ["make", "-C", str(bridge), "clean", "RM=rm"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_bridge_validation_accepts_portable_sha256sum_output(tmp_path):
+    artifact = tmp_path / "bridge.so"
+    artifact.write_bytes(b"bridge")
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+file() {{ printf '%s: ELF 64-bit LSB shared object, x86-64\n' "$1"; }}
+nm() {{
+  printf '0000000000000000 T ylx_open\n'
+  printf '0000000000000000 T ylx_read_imu27\n'
+  printf '0000000000000000 T ylx_close\n'
+}}
+sha256sum() {{ printf '%064d  %s\n' 0 "$1"; }}
+awk() {{
+  [[ $1 != *'{{64}}'* ]] || return 2
+  command awk "$@"
+}}
+validate_bridge "{artifact}"
+'''
+
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_package_metadata_builds_with_ubuntu_host_backend(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "wheelhouse"
+    source.mkdir()
+    output.mkdir()
+    shutil.copy(ROOT / "pyproject.toml", source)
+    setup_cfg = ROOT / "setup.cfg"
+    if setup_cfg.exists():
+        shutil.copy(setup_cfg, source)
+    shutil.copytree(ROOT / "three_device_slam", source / "three_device_slam")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-build-isolation",
+            "--no-deps",
+            str(source),
+            "-w",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert [path.name for path in output.iterdir()] == [
+        "three_device_slam-0.1.0-py3-none-any.whl"
+    ]
+
+
 @pytest.mark.parametrize(
     "script", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
 )
