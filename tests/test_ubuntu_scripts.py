@@ -298,6 +298,74 @@ require_capture_dependencies "{python}" "{install_root}"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+def test_gstreamer_dependency_probe_disables_registry_writes(tmp_path, script_name):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    python = tmp_path / "python"
+    python.write_text(
+        """#!/bin/bash
+if [[ $GST_REGISTRY != /dev/null || $GST_REGISTRY_UPDATE != no ]]; then
+  printf registry >"$XDG_CACHE_HOME/registry.bin"
+fi
+""",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    script = ROOT / "scripts" / script_name
+    shell = f'''
+source "{script}"
+require_gstreamer_dependency "{python}"
+'''
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "HOME": str(tmp_path), "XDG_CACHE_HOME": str(cache)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert list(cache.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_real_gstreamer_verifier_probe_preserves_isolated_home(tmp_path):
+    available = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst',
+        ],
+        capture_output=True,
+    )
+    if available.returncode != 0:
+        pytest.skip("GStreamer introspection is unavailable")
+    home = tmp_path / "home"
+    cache = tmp_path / "cache"
+    home.mkdir()
+    cache.mkdir()
+    script = ROOT / "scripts" / "verify_ubuntu_environment.sh"
+    shell = f'''
+source "{script}"
+require_gstreamer_dependency "{sys.executable}"
+'''
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={**os.environ, "HOME": str(home), "XDG_CACHE_HOME": str(cache)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert list(home.iterdir()) == []
+    assert list(cache.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
 def test_missing_realsense_vendor_artifact_is_blocked_before_install_mutation(tmp_path):
     missing = tmp_path / "missing-pyrealsense2.so"
     script = ROOT / "scripts" / "install_ubuntu.sh"

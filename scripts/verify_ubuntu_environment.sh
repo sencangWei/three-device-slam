@@ -236,6 +236,14 @@ expected_realsense_module_path() {
   printf '%s/venv/lib/python3.10/site-packages/%s\n' "$1" "$realsense_module_filename"
 }
 
+require_gstreamer_dependency() {
+  local python=$1
+  GST_REGISTRY=/dev/null GST_REGISTRY_UPDATE=no \
+    "$python" -I -B -c \
+    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None)' \
+    >/dev/null 2>&1 || fail "FAIL/python_dependency_missing:gstreamer"
+}
+
 require_capture_dependencies() {
   local python=$1 install_root=$2 module_path expected_module
   "$python" -I -B -c 'import yaml' >/dev/null 2>&1 \
@@ -250,9 +258,7 @@ require_capture_dependencies() {
     || fail "FAIL/python_dependency_invalid:pyrealsense2"
   require_trusted_file "$module_path"
   validate_realsense_binary "$module_path"
-  "$python" -I -B -c \
-    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None)' \
-    >/dev/null 2>&1 || fail "FAIL/python_dependency_missing:gstreamer"
+  require_gstreamer_dependency "$python"
 }
 
 main() {
