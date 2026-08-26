@@ -301,13 +301,15 @@ require_capture_dependencies "{python}" "{install_root}"
 @pytest.mark.parametrize(
     "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
 )
-def test_gstreamer_dependency_probe_disables_registry_writes(tmp_path, script_name):
+def test_gstreamer_dependency_probe_avoids_registry_initialization(
+    tmp_path, script_name
+):
     cache = tmp_path / "cache"
     cache.mkdir()
     python = tmp_path / "python"
     python.write_text(
         """#!/bin/bash
-if [[ $GST_REGISTRY != /dev/null || $GST_REGISTRY_UPDATE != no ]]; then
+if [[ $* == *Gst.init* ]]; then
   printf registry >"$XDG_CACHE_HOME/registry.bin"
 fi
 """,

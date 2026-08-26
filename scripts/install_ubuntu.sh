@@ -304,9 +304,8 @@ expected_realsense_module_path() {
 
 require_gstreamer_dependency() {
   local python=$1
-  GST_REGISTRY=/dev/null GST_REGISTRY_UPDATE=no \
-    "$python" -I -B -c \
-    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None)' \
+  "$python" -I -B -c \
+    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; assert Gst.version()[0] == 1' \
     >/dev/null 2>&1 || fail "FAIL/python_dependency_missing:gstreamer"
 }
 
