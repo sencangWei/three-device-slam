@@ -10,14 +10,14 @@
 
 | 项目 | 观测值 |
 |---|---|
-| 验收 UTC | `2026-08-26T03:00:54Z` |
+| 验收 UTC | `2026-08-26T03:20:05Z` |
 | 主机 | `robot-MS-7E19` |
 | 操作系统 | Ubuntu 22.04.5 LTS, x86-64 |
 | ROS | ROS 2 Humble |
 | 分支 | `feature/acquisition-sync-clean-extraction` |
-| 提交 | `bbd4ffa564e8b07a5a447c20b7fda1e362e3f8f8` |
+| 提交 | `4dbe3f1f29c81f6f58403f5a8a8b9e457fe0460b` |
 | 干净验收目录 | `/home/robot/worktrees/three-device-slam-phase1-b2ff517` |
-| Git bundle SHA256 | `ecd7be5c336dd310d7fcc04adb3250c79a7b5d42e864a21286a9242f2b621ab2` |
+| Git bundle SHA256 | `992bdd2b420cecef0637d9cb32f85db516cd6729b4647e8b7049addf4c127f27` |
 
 `git bundle verify` 确认 bundle 包含完整历史；最终 checkout 的 `git status --short --branch` 仅显示分支行，无修改或未跟踪文件。
 
@@ -25,8 +25,8 @@
 
 | 验证 | 结果 |
 |---|---|
-| `python3 -m pytest -q`，最终 bundle checkout | `626 passed in 287.65s` |
-| 本地 WSL 全量回归 | `626 passed in 37.40s` |
+| `python3 -m pytest -q`，最终 bundle checkout | `629 passed in 290.91s` |
+| 本地 WSL 全量回归 | `628 passed, 1 skipped in 41.60s`；WSL 缺少 Gst introspection，Ubuntu 实机执行该项 |
 | `python3 -m compileall -q three_device_slam` | exit `0` |
 | `git diff --check` | exit `0` |
 | `sudo ./scripts/install_ubuntu.sh` | exit `0`；重复安装成功 |
@@ -34,6 +34,7 @@
 | 安装包导入 | `three_device_slam 0.1.0`，来自 `/opt/three-device-slam/venv/...` |
 | 采集运行依赖 | `yaml 5.4.1`、`cv2 4.5.4`、`pyrealsense2`、`GStreamer 1.20.3` 均从隔离解释器成功导入 |
 | RealSense Python 模块 | 运行路径位于 `/opt/three-device-slam/venv/...`；SHA256 `ec0089d1618732f298048b3f4bb4dccab99c95361f60ccd4ade8d78f1922b0a1` |
+| GStreamer 只读探针 | Ubuntu 实机隔离 HOME/XDG 零写；验证前后 `/dev/null` 均为字符设备 `1:3`、模式 `0666`、大小 `0` |
 | 2UQ2 XU 桥接库 | x86-64 ELF；导出 `ylx_open`、`ylx_read_imu27`、`ylx_close` |
 | 已安装桥接库 SHA256 | `09419497fbb2af4cb28374e607e5f6eb7b6b32629048aef0bcb32e44a6d63227` |
 | 原仓运行时引用扫描 | `FINAL_ISOLATION_PASS` |
@@ -49,6 +50,7 @@
 3. Ubuntu 22.04 默认 mawk 不支持 `{64}` 间隔正则，导致正确 SHA256 被拒绝；校验现使用长度和字符集判断。
 4. pip 22 + `--system-site-packages` 的构建隔离优先导入 setuptools 59.6，PEP 621 元数据被构建成 `UNKNOWN-0.0.0`；包元数据现使用 setuptools 59.6 可读的 `setup.cfg`，回归测试要求生成 `three_device_slam-0.1.0` wheel。
 5. 原环境验证器只验证主包导入，未发现 `pyrealsense2` 缺失；现安装器和只读验证器逐项导入 YAML、OpenCV、RealSense 和 GStreamer，并固定 RealSense 模块路径、架构与 SHA256。
+6. GStreamer 初始化可能写入 registry；曾尝试将 registry 指向 `/dev/null`，Ubuntu 实测发现 GStreamer 会替换该设备节点。测试后已立即恢复 `/dev/null` 为字符设备 `1:3`、模式 `0666`；最终探针完全不调用 `Gst.init`，只导入 Gst 并读取版本，且有真实零写与设备节点不变回归。
 
 上述问题均有先失败、再通过的自动化回归测试。
 
