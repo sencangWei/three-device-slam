@@ -10,6 +10,12 @@ import pytest
 from three_device_slam.devices.d405_umi import worker as capture_quality_module
 
 rs = capture_quality_module.rs
+IDENTITY_ARGS = [
+    "--serial",
+    "test-d405",
+    "--imu-port",
+    "/dev/serial/by-id/test-imu",
+]
 
 
 from three_device_slam.devices.d405_umi.worker import (
@@ -407,21 +413,26 @@ def test_write_frames_csv_uses_global_time_not_relative_bag_timestamp(tmp_path):
 
 
 def test_joint_barrier_arguments_are_optional():
-    args = build_parser().parse_args([])
+    args = build_parser().parse_args(IDENTITY_ARGS)
 
     assert args.barrier_dir is None
     assert args.session is None
     assert args.device_id == "d405"
 
 
+def test_worker_requires_explicit_device_identity():
+    with pytest.raises(SystemExit):
+        parse_args([])
+
+
 def test_duration_omission_is_indefinite_until_stop():
-    assert build_parser().parse_args([]).duration is None
+    assert build_parser().parse_args(IDENTITY_ARGS).duration is None
 
 
 @pytest.mark.parametrize("duration", ["nan", "inf", "-inf", "0", "-1"])
 def test_parser_rejects_non_finite_and_non_positive_duration(duration):
     with pytest.raises(SystemExit):
-        parse_args(["--duration", duration])
+        parse_args([*IDENTITY_ARGS, "--duration", duration])
 
 
 def test_joint_worker_preserves_product_td():
@@ -472,12 +483,15 @@ def test_joint_frames_csv_uses_explicit_unverified_timestamp_domain(tmp_path):
 
 def test_joint_arguments_require_session_and_hand_device(tmp_path):
     with pytest.raises(SystemExit):
-        parse_args(["--barrier-dir", str(tmp_path)])
+        parse_args([*IDENTITY_ARGS, "--barrier-dir", str(tmp_path)])
     with pytest.raises(SystemExit):
-        parse_args(["--barrier-dir", str(tmp_path), "--device-id", "left"])
+        parse_args(
+            [*IDENTITY_ARGS, "--barrier-dir", str(tmp_path), "--device-id", "left"]
+        )
 
     args = parse_args(
         [
+            *IDENTITY_ARGS,
             "--barrier-dir",
             str(tmp_path / "barrier"),
             "--session",
@@ -491,10 +505,11 @@ def test_joint_arguments_require_session_and_hand_device(tmp_path):
 
 def test_phase_one_parser_rejects_live_vins_in_all_modes(tmp_path):
     with pytest.raises(SystemExit):
-        parse_args(["--publish-vins"])
+        parse_args([*IDENTITY_ARGS, "--publish-vins"])
     with pytest.raises(SystemExit):
         parse_args(
             [
+                *IDENTITY_ARGS,
                 "--barrier-dir",
                 str(tmp_path / "barrier"),
                 "--session",
@@ -678,9 +693,12 @@ def test_joint_controller_keeps_cross_start_backlog_warmup(tmp_path):
 
 
 def test_capture_session_directory_preserves_standalone_naming(tmp_path):
-    standalone = build_parser().parse_args(["--output-root", str(tmp_path)])
+    standalone = build_parser().parse_args(
+        [*IDENTITY_ARGS, "--output-root", str(tmp_path)]
+    )
     joint = parse_args(
         [
+            *IDENTITY_ARGS,
             "--barrier-dir",
             str(tmp_path / "barrier"),
             "--session",
@@ -704,6 +722,7 @@ def test_joint_worker_rejects_sealed_session_before_loading_hardware(
     (session / "session.seal.json").write_text("sealed", encoding="utf-8")
     args = parse_args(
         [
+            *IDENTITY_ARGS,
             "--barrier-dir",
             str(session),
             "--session",

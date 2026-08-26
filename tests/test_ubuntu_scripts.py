@@ -225,6 +225,93 @@ def test_package_metadata_builds_with_ubuntu_host_backend(tmp_path):
     ]
 
 
+def test_package_metadata_declares_yaml_runtime_dependency():
+    text = (ROOT / "setup.cfg").read_text(encoding="utf-8")
+
+    assert "PyYAML>=5.4" in text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+@pytest.mark.parametrize(
+    ("failed_import", "reason"),
+    [
+        ("yaml", "FAIL/python_dependency_missing:yaml"),
+        ("cv2", "FAIL/python_dependency_missing:cv2"),
+        ("pyrealsense2", "FAIL/python_dependency_missing:pyrealsense2"),
+        ("gi", "FAIL/python_dependency_missing:gstreamer"),
+    ],
+)
+@pytest.mark.parametrize(
+    "script_name", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
+)
+def test_capture_dependency_failure_has_stable_classification(
+    tmp_path, script_name, failed_import, reason
+):
+    install_root = tmp_path / "install"
+    module = (
+        install_root
+        / "venv"
+        / "lib"
+        / "python3.10"
+        / "site-packages"
+        / "pyrealsense2.cpython-310-x86_64-linux-gnu.so"
+    )
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"module")
+    python = tmp_path / "python"
+    python.write_text(
+        """#!/bin/bash
+case "$*" in
+  *"import yaml"*) [[ $FAILED_IMPORT != yaml ]] ;;
+  *"import cv2"*) [[ $FAILED_IMPORT != cv2 ]] ;;
+  *"import pyrealsense2"*)
+    [[ $FAILED_IMPORT != pyrealsense2 ]] || exit 1
+    printf '%s\n' "$REALSENSE_MODULE"
+    ;;
+  *"import gi"*) [[ $FAILED_IMPORT != gi ]] ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    script = ROOT / "scripts" / script_name
+    shell = f'''
+source "{script}"
+require_trusted_file() {{ :; }}
+validate_realsense_binary() {{ :; }}
+require_capture_dependencies "{python}" "{install_root}"
+'''
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", shell],
+        env={
+            **os.environ,
+            "FAILED_IMPORT": failed_import,
+            "REALSENSE_MODULE": str(module),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="bash behavior test")
+def test_missing_realsense_vendor_artifact_is_blocked_before_install_mutation(tmp_path):
+    missing = tmp_path / "missing-pyrealsense2.so"
+    script = ROOT / "scripts" / "install_ubuntu.sh"
+    shell = f'''
+source "{script}"
+require_realsense_vendor_artifact "{missing}"
+'''
+
+    result = subprocess.run(["/bin/bash", "-c", shell], capture_output=True, text=True)
+
+    assert result.returncode == 3
+    assert result.stderr.strip() == "BLOCKED/realsense_python_missing"
+
+
 @pytest.mark.parametrize(
     "script", ["install_ubuntu.sh", "verify_ubuntu_environment.sh"]
 )

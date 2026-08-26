@@ -1099,11 +1099,8 @@ def analyze_db3_metadata(bag_path: Path) -> dict[str, dict]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="D405 720p三路(RGB+双IR)＋外置IMU采集")
-    parser.add_argument("--serial", default="260322273737")
-    parser.add_argument(
-        "--imu-port",
-        default="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B7E005674-if00",
-    )
+    parser.add_argument("--serial", required=True)
+    parser.add_argument("--imu-port", required=True)
     parser.add_argument("--imu-baud", type=int, default=921600)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument(

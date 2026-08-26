@@ -3,6 +3,9 @@ set -euo pipefail
 
 fail() { echo "$1" >&2; exit 2; }
 
+realsense_module_filename=pyrealsense2.cpython-310-x86_64-linux-gnu.so
+realsense_module_sha256=ec0089d1618732f298048b3f4bb4dccab99c95361f60ccd4ade8d78f1922b0a1
+
 source_ros_setup() {
   local setup=$1
   set +u
@@ -218,6 +221,40 @@ verify_python_runtime() {
   "$python" -I -B -c 'import three_device_slam' || fail "FAIL/python_package_missing"
 }
 
+validate_realsense_binary() {
+  local artifact=$1 actual_hash
+  [[ -f ${artifact} && ! -L ${artifact} ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  file "$artifact" | grep -Eq 'ELF 64-bit.*x86-64' \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  actual_hash=$(sha256sum "$artifact" | awk '{print $1}')
+  [[ ${actual_hash} == "${realsense_module_sha256}" ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+}
+
+expected_realsense_module_path() {
+  printf '%s/venv/lib/python3.10/site-packages/%s\n' "$1" "$realsense_module_filename"
+}
+
+require_capture_dependencies() {
+  local python=$1 install_root=$2 module_path expected_module
+  "$python" -I -B -c 'import yaml' >/dev/null 2>&1 \
+    || fail "FAIL/python_dependency_missing:yaml"
+  "$python" -I -B -c 'import cv2' >/dev/null 2>&1 \
+    || fail "FAIL/python_dependency_missing:cv2"
+  module_path=$("$python" -I -B -c \
+    'import pyrealsense2, pathlib; print(pathlib.Path(pyrealsense2.__file__).resolve())') \
+    || fail "FAIL/python_dependency_missing:pyrealsense2"
+  expected_module=$(expected_realsense_module_path "$install_root")
+  [[ ${module_path} == "${expected_module}" ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  require_trusted_file "$module_path"
+  validate_realsense_binary "$module_path"
+  "$python" -I -B -c \
+    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None)' \
+    >/dev/null 2>&1 || fail "FAIL/python_dependency_missing:gstreamer"
+}
+
 main() {
   local install_root lib bridge manifest members robot_uid robot_gid session_root
   export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -239,6 +276,7 @@ main() {
   manifest="${bridge}.sha256"
   require_trusted_tree "$install_root"
   verify_python_runtime "$install_root"
+  require_capture_dependencies "${install_root}/venv/bin/python" "$install_root"
   require_trusted_path "$lib"
   require_trusted_file "$bridge"
   require_trusted_file "$manifest"

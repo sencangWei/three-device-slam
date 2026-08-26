@@ -3,7 +3,7 @@
 ## 结论
 
 - `PASS/phase1_software`：三设备同步采集第一阶段软件已在 Ubuntu 22.04 / ROS 2 Humble 上完成安装与无硬件验收。
-- `BLOCKED/phase1_hil:no_devices`：本次没有 D405、外部 IMU 和两台 2UQ2，未执行真实三设备采集。
+- `BLOCKED/phase1_hil:device_hardware_unavailable`：本次没有两台 D405、两个外部 IMU 和一台 2UQ2，未执行真实三设备采集。
 - `BLOCKED/spatial_alignment:phase_not_delivered`：第一帧健康 Ego SLAM 位姿、重力对齐和无标记双 UMI 空间约束属于后续空间阶段，不属于本次软件 PASS。
 
 ## 受测版本与环境
@@ -59,4 +59,4 @@
 
 ## 实机验收入口条件
 
-具备两台 2UQ2、一台 D405、外部 IMU、真实设备身份和真实标定 ID 后，才能创建 `/etc/three-device-slam/product.json` 并执行 Task 9。真实 HIL 必须验证预热、联合健康门、自动起录、Ctrl+C/故障封存、三设备时间域证据、离线索引和校验；未执行前不得标记 HIL PASS。
+具备一台 2UQ2、两台 D405、两个独立外部 IMU、真实设备身份和真实标定 ID 后，才能创建 `/etc/three-device-slam/product.json` 并执行 Task 9。真实 HIL 必须验证预热、联合健康门、自动起录、Ctrl+C/故障封存、三设备时间域证据、离线索引和校验；未执行前不得标记 HIL PASS。

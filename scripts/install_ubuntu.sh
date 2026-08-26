@@ -3,6 +3,10 @@ set -euo pipefail
 
 fail() { echo "$1" >&2; exit 2; }
 
+realsense_module_filename=pyrealsense2.cpython-310-x86_64-linux-gnu.so
+realsense_module_sha256=ec0089d1618732f298048b3f4bb4dccab99c95361f60ccd4ade8d78f1922b0a1
+realsense_vendor_artifact=/opt/three-device-slam-vendor/librealsense-rsusb-2.58.2/python/${realsense_module_filename}
+
 source_ros_setup() {
   local setup=$1
   set +u
@@ -273,6 +277,50 @@ validate_python_runtime() {
   "$python" -I -B -m pip --version >/dev/null 2>&1 || fail "FAIL/tool_missing:pip"
 }
 
+validate_realsense_binary() {
+  local artifact=$1 actual_hash
+  [[ -f ${artifact} && ! -L ${artifact} ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  file "$artifact" | grep -Eq 'ELF 64-bit.*x86-64' \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  actual_hash=$(sha256sum "$artifact" | awk '{print $1}')
+  [[ ${actual_hash} == "${realsense_module_sha256}" ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+}
+
+require_realsense_vendor_artifact() {
+  local artifact=$1
+  if [[ ! -e ${artifact} && ! -L ${artifact} ]]; then
+    echo "BLOCKED/realsense_python_missing" >&2
+    exit 3
+  fi
+  require_trusted_file "$artifact"
+  validate_realsense_binary "$artifact"
+}
+
+expected_realsense_module_path() {
+  printf '%s/venv/lib/python3.10/site-packages/%s\n' "$1" "$realsense_module_filename"
+}
+
+require_capture_dependencies() {
+  local python=$1 install_root=$2 module_path expected_module
+  "$python" -I -B -c 'import yaml' >/dev/null 2>&1 \
+    || fail "FAIL/python_dependency_missing:yaml"
+  "$python" -I -B -c 'import cv2' >/dev/null 2>&1 \
+    || fail "FAIL/python_dependency_missing:cv2"
+  module_path=$("$python" -I -B -c \
+    'import pyrealsense2, pathlib; print(pathlib.Path(pyrealsense2.__file__).resolve())') \
+    || fail "FAIL/python_dependency_missing:pyrealsense2"
+  expected_module=$(expected_realsense_module_path "$install_root")
+  [[ ${module_path} == "${expected_module}" ]] \
+    || fail "FAIL/python_dependency_invalid:pyrealsense2"
+  require_trusted_file "$module_path"
+  validate_realsense_binary "$module_path"
+  "$python" -I -B -c \
+    'import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None)' \
+    >/dev/null 2>&1 || fail "FAIL/python_dependency_missing:gstreamer"
+}
+
 normalize_venv_path() {
   local venv=$1 lib64="${1}/lib64" target
   if [[ -L ${lib64} ]]; then
@@ -443,7 +491,50 @@ cleanup_temporary_lib() {
 
 cleanup_install_temporary_paths() {
   cleanup_temporary_lib
+  cleanup_temporary_realsense
   cleanup_temporary_venv
+}
+
+temporary_realsense=
+cleanup_temporary_realsense() {
+  local site_packages
+  [[ -n ${temporary_realsense} ]] || return 0
+  site_packages=$(dirname "$temporary_realsense")
+  case ${temporary_realsense} in
+    "${site_packages}"/.pyrealsense2.*.tmp)
+      [[ ! -L ${temporary_realsense} ]] && rm -f -- "$temporary_realsense"
+      ;;
+  esac
+  temporary_realsense=
+}
+
+publish_realsense_module() {
+  local artifact=$1 install_root=$2 site_packages destination
+  site_packages="${install_root}/venv/lib/python3.10/site-packages"
+  destination=$(expected_realsense_module_path "$install_root")
+  require_trusted_path "$site_packages"
+  require_realsense_vendor_artifact "$artifact"
+  if [[ -e ${destination} || -L ${destination} ]]; then
+    require_trusted_file "$destination"
+    validate_realsense_binary "$destination"
+    return
+  fi
+  temporary_realsense=$(mktemp "${site_packages}/.pyrealsense2.XXXXXXXX.tmp")
+  install -o root -g root -m 0644 "$artifact" "$temporary_realsense"
+  require_trusted_file "$temporary_realsense"
+  validate_realsense_binary "$temporary_realsense"
+  sync -f "$temporary_realsense"
+  mv -T --no-clobber "$temporary_realsense" "$destination"
+  if [[ -e ${temporary_realsense} || -L ${temporary_realsense} ]]; then
+    require_trusted_file "$destination"
+    validate_realsense_binary "$destination"
+    cleanup_temporary_realsense
+  else
+    temporary_realsense=
+  fi
+  sync -f "$site_packages"
+  require_trusted_file "$destination"
+  validate_realsense_binary "$destination"
 }
 
 prepare_bridge() {
@@ -518,18 +609,20 @@ publish_bridge() {
 }
 
 install_runtime() {
-  local artifact=$1 install_root=$2 repo_root=$3 python
+  local artifact=$1 install_root=$2 repo_root=$3 realsense_artifact=${4:-$realsense_vendor_artifact} python
   [[ ${python_venv_capability_checked} == true ]] || probe_python_venv
   require_runtime_parent_access "$install_root" "$install_root"
   prepare_bridge "$artifact" "$install_root"
   python="${install_root}/venv/bin/python"
   ensure_venv "$install_root"
   validate_python_runtime "$install_root" "$python"
+  publish_realsense_module "$realsense_artifact" "$install_root"
   "$python" -I -B -m pip install "$repo_root"
   chmod -R go-w "${install_root}/venv"
   require_trusted_tree "$install_root"
   require_trusted_file "$python"
   require_venv_runtime_access "${install_root}/venv"
+  require_capture_dependencies "$python" "$install_root"
   publish_prepared_bridge "$install_root"
   require_trusted_tree "$install_root"
 }
@@ -554,6 +647,7 @@ main() {
   vendor_sdk=/home/robot/vendor/2uq2/YLX_XU_API_2026721
   [[ -f ${vendor_sdk}/include/V4L2/extunit.h ]] \
     || { echo "BLOCKED/2uq2_vendor_sdk_missing" >&2; exit 3; }
+  require_realsense_vendor_artifact "$realsense_vendor_artifact"
   id robot >/dev/null 2>&1 || fail "FAIL/robot_account_missing"
   ensure_root_directory /run/three-device-slam
   acquire_install_lock /run/three-device-slam/install.lock
@@ -569,7 +663,7 @@ main() {
     VENDOR_SDK="$vendor_sdk" CC=cc RM=rm
   artifact="$repo_root/native/2uq2_xu_bridge/build/libtwo_uq2_xu.so"
   trap cleanup_install_temporary_paths EXIT
-  install_runtime "$artifact" "$install_root" "$repo_root"
+  install_runtime "$artifact" "$install_root" "$repo_root" "$realsense_vendor_artifact"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
