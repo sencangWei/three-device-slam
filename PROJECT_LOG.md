@@ -20,6 +20,8 @@
 - 远程机独立安装 `/opt/three-device-slam`；未创建虚假 `product.json`，未写入虚假设备身份或标定 ID。
 - RealSense Python 模块经固定架构和 SHA256 校验后安装进独立 venv，运行时不依赖 D405 发布目录。
 - GStreamer 只读探针不执行 registry 初始化；Ubuntu 实测隔离 HOME/XDG 零写，`/dev/null` 保持字符设备 `1:3`、模式 `0666`。
+- `feature/acquisition-sync-clean-extraction` 已快进合并到正式 `main` 并清理；Windows 主工作树通过 `.gitattributes` 固定 shell 脚本为 LF，合并后 WSL 回归为 `629 passed, 1 skipped`。
+- 合并前主工作树中的旧启动副本未被覆盖，完整保存在 `stash@{0}`（`preserve pre-main-merge bootstrap files 2026-08-26`）。
 
 当前状态：第一阶段软件验收 `PASS`。由于没有真实设备，三设备 HIL 验收保持 `BLOCKED/device_hardware_unavailable`；第一帧健康 Ego SLAM 位姿、重力对齐和无标记双 UMI 空间约束仍是后续空间阶段。
 
