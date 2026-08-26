@@ -11,6 +11,14 @@
 - 用户确认量产不依赖每次拍标定板或外露 tag；空间链路采用 Ego 主轨迹、无标记双 UMI 6D 观测、各自 VIO 增量和左右独立因子图。
 - 完整仓库设计已写入 docs/superpowers/specs/2026-08-25-three-device-slam-repository-design.md。
 
-当前状态：用户已批准仓库设计。仅建立独立本地 Git 仓库、设计和实施计划，尚未迁移或修改任何产品代码，尚未创建远端 GitHub 仓库。
+## 2026-08-26
 
-下一步：按 docs/superpowers/plans/2026-08-25-acquisition-sync-clean-extraction.md 执行第一阶段干净提取；执行方式由用户选择。
+- 第一阶段干净提取已完成：独立实现三设备会话、双 2UQ2 与 D405+外部 IMU 采集适配、联合健康门、预热、自动起录、Ctrl+C/故障封存、时间索引、离线校验和 Ubuntu 一键入口。
+- 最终软件提交为 `b2ff517e6d8953957afa91fdd4461d1a7552d1c5`；Ubuntu 22.04 / ROS 2 Humble 干净 checkout 上 `615 passed`，安装器、只读环境验证器和缺配置安全阻塞入口均通过。
+- 远程验收发现并修复 ROS nounset、首次 make clean、Ubuntu mawk SHA256 和 setuptools 59 包元数据兼容问题；证据见 `docs/acceptance/phase1-software-acceptance.md`。
+- 原 D405 正式仓库未修改，`/home/robot/ego_vio_humble` 仍指向 `product_v1_20260824`。
+- 远程机独立安装 `/opt/three-device-slam`；未创建虚假 `product.json`，未写入虚假设备身份或标定 ID。
+
+当前状态：第一阶段软件验收 `PASS`。由于没有真实设备，三设备 HIL 验收保持 `BLOCKED/no_devices`；第一帧健康 Ego SLAM 位姿、重力对齐和无标记双 UMI 空间约束仍是后续空间阶段。
+
+下一步：设备到场后按 Task 9 执行真实三设备一键采集验收；HIL 通过后再进入空间对齐和乌帮图系统阶段。
