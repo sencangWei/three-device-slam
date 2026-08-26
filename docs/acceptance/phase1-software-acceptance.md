@@ -10,14 +10,14 @@
 
 | 项目 | 观测值 |
 |---|---|
-| 验收 UTC | `2026-08-26T02:26:13Z` |
+| 验收 UTC | `2026-08-26T03:00:54Z` |
 | 主机 | `robot-MS-7E19` |
 | 操作系统 | Ubuntu 22.04.5 LTS, x86-64 |
 | ROS | ROS 2 Humble |
 | 分支 | `feature/acquisition-sync-clean-extraction` |
-| 提交 | `b2ff517e6d8953957afa91fdd4461d1a7552d1c5` |
+| 提交 | `bbd4ffa564e8b07a5a447c20b7fda1e362e3f8f8` |
 | 干净验收目录 | `/home/robot/worktrees/three-device-slam-phase1-b2ff517` |
-| Git bundle SHA256 | `c25af540ac59d12e4258db0e269e14b68bb71156d0046dcf70e0c7d5efdb6519` |
+| Git bundle SHA256 | `ecd7be5c336dd310d7fcc04adb3250c79a7b5d42e864a21286a9242f2b621ab2` |
 
 `git bundle verify` 确认 bundle 包含完整历史；最终 checkout 的 `git status --short --branch` 仅显示分支行，无修改或未跟踪文件。
 
@@ -25,13 +25,15 @@
 
 | 验证 | 结果 |
 |---|---|
-| `python3 -m pytest tests -q`，最终 bundle checkout | `615 passed in 292.26s` |
-| 本地 WSL 全量回归 | `615 passed in 74.28s` |
+| `python3 -m pytest -q`，最终 bundle checkout | `626 passed in 287.65s` |
+| 本地 WSL 全量回归 | `626 passed in 37.40s` |
 | `python3 -m compileall -q three_device_slam` | exit `0` |
 | `git diff --check` | exit `0` |
 | `sudo ./scripts/install_ubuntu.sh` | exit `0`；重复安装成功 |
 | `sudo ./scripts/verify_ubuntu_environment.sh` | `PASS/ubuntu_environment` |
 | 安装包导入 | `three_device_slam 0.1.0`，来自 `/opt/three-device-slam/venv/...` |
+| 采集运行依赖 | `yaml 5.4.1`、`cv2 4.5.4`、`pyrealsense2`、`GStreamer 1.20.3` 均从隔离解释器成功导入 |
+| RealSense Python 模块 | 运行路径位于 `/opt/three-device-slam/venv/...`；SHA256 `ec0089d1618732f298048b3f4bb4dccab99c95361f60ccd4ade8d78f1922b0a1` |
 | 2UQ2 XU 桥接库 | x86-64 ELF；导出 `ylx_open`、`ylx_read_imu27`、`ylx_close` |
 | 已安装桥接库 SHA256 | `09419497fbb2af4cb28374e607e5f6eb7b6b32629048aef0bcb32e44a6d63227` |
 | 原仓运行时引用扫描 | `FINAL_ISOLATION_PASS` |
@@ -46,6 +48,7 @@
 2. 安装器固定 `RM=rm` 时，首次 `make clean` 会因不存在 `build/` 失败；清理目标现为幂等的 `rm -rf -- build`。
 3. Ubuntu 22.04 默认 mawk 不支持 `{64}` 间隔正则，导致正确 SHA256 被拒绝；校验现使用长度和字符集判断。
 4. pip 22 + `--system-site-packages` 的构建隔离优先导入 setuptools 59.6，PEP 621 元数据被构建成 `UNKNOWN-0.0.0`；包元数据现使用 setuptools 59.6 可读的 `setup.cfg`，回归测试要求生成 `three_device_slam-0.1.0` wheel。
+5. 原环境验证器只验证主包导入，未发现 `pyrealsense2` 缺失；现安装器和只读验证器逐项导入 YAML、OpenCV、RealSense 和 GStreamer，并固定 RealSense 模块路径、架构与 SHA256。
 
 上述问题均有先失败、再通过的自动化回归测试。
 
@@ -54,6 +57,7 @@
 - `/home/robot/ego_vio_humble` 在验收前后均解析到 `/home/robot/releases/ego_vio_humble/product_v1_20260824`。
 - 远程 D405 正式仓库保持在 `release/humble-stm32-product-v1-20260824`，HEAD 为 `a7a143d`，工作树干净；本任务未修改该仓库、分支或虚拟环境。
 - 三设备产品独立安装到 `/opt/three-device-slam`，配置目录为 `/etc/three-device-slam`，会话目录为 `/var/lib/three-device-slam/sessions`。
+- RealSense Python 二进制从正式 D405 发布包只读复制到 root 管理的独立输入目录 `/opt/three-device-slam-vendor`，随后安装进三设备 venv；运行时不引用 D405 发布目录。
 - 为满足 Ubuntu venv 前置条件，安装了官方包 `python3.10-venv`、`python3-pip-whl` 和 `python3-setuptools-whl`；没有替换系统 Python。
 - 安装产生的 checkout 内临时 `build/`、`three_device_slam.egg-info/` 和桥接 `build/` 已清理，最终验收 checkout 恢复干净。
 

@@ -14,10 +14,11 @@
 ## 2026-08-26
 
 - 第一阶段干净提取已完成：独立实现三设备会话、单 2UQ2 Ego 与双 D405+外部 IMU 采集适配、联合健康门、预热、自动起录、Ctrl+C/故障封存、时间索引、离线校验和 Ubuntu 一键入口。
-- 最终软件提交为 `b2ff517e6d8953957afa91fdd4461d1a7552d1c5`；Ubuntu 22.04 / ROS 2 Humble 干净 checkout 上 `615 passed`，安装器、只读环境验证器和缺配置安全阻塞入口均通过。
+- 最终软件提交为 `bbd4ffa564e8b07a5a447c20b7fda1e362e3f8f8`；Ubuntu 22.04 / ROS 2 Humble 干净 checkout 上 `626 passed`，安装器、只读环境验证器和缺配置安全阻塞入口均通过。
 - 远程验收发现并修复 ROS nounset、首次 make clean、Ubuntu mawk SHA256 和 setuptools 59 包元数据兼容问题；证据见 `docs/acceptance/phase1-software-acceptance.md`。
 - 原 D405 正式仓库未修改，`/home/robot/ego_vio_humble` 仍指向 `product_v1_20260824`。
 - 远程机独立安装 `/opt/three-device-slam`；未创建虚假 `product.json`，未写入虚假设备身份或标定 ID。
+- RealSense Python 模块经固定架构和 SHA256 校验后安装进独立 venv，运行时不依赖 D405 发布目录。
 
 当前状态：第一阶段软件验收 `PASS`。由于没有真实设备，三设备 HIL 验收保持 `BLOCKED/device_hardware_unavailable`；第一帧健康 Ego SLAM 位姿、重力对齐和无标记双 UMI 空间约束仍是后续空间阶段。
 
