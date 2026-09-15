@@ -1,10 +1,12 @@
 import csv
 import hashlib
 import json
+import subprocess
 import struct
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from three_device_slam.devices.d405_umi import worker as capture_quality_module
@@ -35,7 +37,9 @@ from three_device_slam.devices.d405_umi.worker import (
     capture_session_directory,
     configure_global_time,
     configure_ir_auto_exposure,
+    count_persisted_imu_samples,
     decode_cdr_string,
+    drain_frame_queue,
     metadata_frame_from_text,
     pair_metadata_frames,
     parse_args,
@@ -50,6 +54,81 @@ from three_device_slam.devices.d405_umi.worker import (
     imu_reader_warmup_frames,
     write_frames_csv,
 )
+
+
+class FakeFrameQueue:
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.polls = 0
+
+    def poll_for_frame(self):
+        self.polls += 1
+        return self.frames.pop(0) if self.frames else None
+
+
+def test_joint_monitor_drains_available_frames_before_barrier_io():
+    queue = FakeFrameQueue(["color", "left", "right", "next-color"])
+
+    assert drain_frame_queue(queue, limit=3) == ("color", "left", "right")
+    assert queue.frames == ["next-color"]
+    assert queue.polls == 3
+
+    assert drain_frame_queue(queue, limit=64) == ("next-color",)
+    assert queue.polls == 5
+
+
+def test_joint_formal_imu_count_uses_persisted_monotonic_window(tmp_path):
+    path = tmp_path / "imu_ts.csv"
+    path.write_text(
+        "counter,ts_mono,rx_mono,ts_wall\n"
+        "1,0.9975,0.9976,10.0\n"
+        "2,1.0000,1.0001,10.1\n"
+        "3,1.0025,1.0026,10.2\n"
+        "4,2.0000,2.0001,11.0\n"
+        "5,2.0025,2.0026,11.1\n",
+        encoding="utf-8",
+    )
+
+    assert count_persisted_imu_samples(
+        path, start_ns=1_000_000_000, stop_ns=2_000_000_000
+    ) == 3
+
+
+def test_joint_formal_imu_count_rejects_invalid_persisted_timestamp(tmp_path):
+    path = tmp_path / "imu_ts.csv"
+    path.write_text("counter,ts_mono\n1,not-a-time\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ts_mono"):
+        count_persisted_imu_samples(path, start_ns=0, stop_ns=1)
+
+
+def test_cli_can_pin_the_physical_imu_protocol():
+    args = parse_args(
+        [*IDENTITY_ARGS, "--imu-protocol", "stm32_combined_v1"]
+    )
+
+    assert args.imu_protocol == "stm32_combined_v1"
+
+    with pytest.raises(SystemExit):
+        parse_args([*IDENTITY_ARGS, "--imu-protocol", "invented"])
+
+
+def test_d405_run_forwards_shared_realsense_context(monkeypatch):
+    context = object()
+    observed = []
+    monkeypatch.setattr(
+        capture_quality_module,
+        "_run_claimed",
+        lambda args, *, realsense_context=None: observed.append(realsense_context)
+        or 0,
+    )
+
+    result = capture_quality_module.run(
+        SimpleNamespace(session=None), realsense_context=context
+    )
+
+    assert result == 0
+    assert observed == [context]
 
 
 class FakeOptionRange:
@@ -522,8 +601,13 @@ def test_phase_one_parser_rejects_live_vins_in_all_modes(tmp_path):
 
 
 def test_worker_import_does_not_load_hardware_modules():
-    assert "cv2" not in sys.modules
-    assert "pyrealsense2" not in sys.modules
+    code = """
+import sys
+import three_device_slam.devices.d405_umi.worker
+assert 'cv2' not in sys.modules
+assert 'pyrealsense2' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_barrier_root_normalizes_session_and_barrier_paths(tmp_path):

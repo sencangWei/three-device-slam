@@ -21,19 +21,22 @@ class UmiConfig:
     serial: str
     imu_path: str
     calibration_id: str
+    imu_protocol: str = "auto"
 
 
 @dataclass(frozen=True)
 class EgoConfig:
-    video_device: str
-    xu_library: str
+    type: str
     calibration_id: str
+    video_device: str | None = None
+    xu_library: str | None = None
+    serial: str | None = None
 
 
 @dataclass(frozen=True)
 class ProductConfig:
-    left: UmiConfig
-    right: UmiConfig
+    left: UmiConfig | None
+    right: UmiConfig | None
     ego: EgoConfig
     output_root: Path
     duration_s: float | None
@@ -55,32 +58,30 @@ def load_product_config(path: Path | str) -> ProductConfig:
     root = _object(payload, "product config")
     _exact_fields(
         root,
-        {"schema", "left", "right", "ego", "output_root", "duration_s"},
+        {"schema", "ego", "output_root", "duration_s"},
         "product config",
+        optional={"left", "right"},
     )
     if root["schema"] != SCHEMA:
         raise ConfigError("product config schema is unsupported")
 
-    left = _umi(root["left"], "left")
-    right = _umi(root["right"], "right")
-    if left.serial == right.serial:
-        raise ConfigError("left and right D405 identities must be distinct")
-    if left.imu_path == right.imu_path:
-        raise ConfigError("left and right IMU paths must be distinct")
-
     ego_value = _object(root["ego"], "ego")
-    _exact_fields(
-        ego_value,
-        {"video_device", "xu_library", "calibration_id"},
-        "ego",
-    )
-    ego = EgoConfig(
-        video_device=_linux_path(ego_value["video_device"], "ego.video_device"),
-        xu_library=_linux_path(ego_value["xu_library"], "ego.xu_library"),
-        calibration_id=_nonempty_string(
-            ego_value["calibration_id"], "ego.calibration_id"
-        ),
-    )
+    ego = _ego(ego_value)
+    left_value = root.get("left")
+    right_value = root.get("right")
+    left = _umi(left_value, "left") if left_value is not None else None
+    right = _umi(right_value, "right") if right_value is not None else None
+    if ego.type != "d435i" and left is None:
+        raise ConfigError("left UMI is required unless ego.type is d435i")
+    if ego.type != "d435i" and right is None:
+        raise ConfigError("right UMI is required unless ego.type is d435i")
+    if ego.type == "d435i" and left is None and right is None:
+        raise ConfigError("at least one UMI is required")
+    if left is not None and right is not None:
+        if left.serial == right.serial:
+            raise ConfigError("left and right D405 identities must be distinct")
+        if left.imu_path == right.imu_path:
+            raise ConfigError("left and right IMU paths must be distinct")
     duration = root["duration_s"]
     if duration is not None:
         if isinstance(duration, bool) or not isinstance(duration, (int, float)):
@@ -105,14 +106,50 @@ def load_product_config(path: Path | str) -> ProductConfig:
 
 def _umi(value: Any, name: str) -> UmiConfig:
     item = _object(value, name)
-    _exact_fields(item, {"serial", "imu_path", "calibration_id"}, name)
+    expected = {"serial", "imu_path", "calibration_id"}
+    if "imu_protocol" in item:
+        expected.add("imu_protocol")
+    _exact_fields(item, expected, name)
+    imu_protocol = item.get("imu_protocol", "auto")
+    if imu_protocol not in {"auto", "kt_ex9_37", "stm32_combined_v1"}:
+        raise ConfigError(
+            f"{name}.imu_protocol must be auto, kt_ex9_37, or stm32_combined_v1"
+        )
     return UmiConfig(
         serial=_nonempty_string(item["serial"], f"{name}.serial"),
         imu_path=_linux_path(item["imu_path"], f"{name}.imu_path"),
         calibration_id=_nonempty_string(
             item["calibration_id"], f"{name}.calibration_id"
         ),
+        imu_protocol=imu_protocol,
     )
+
+
+def _ego(value: dict[str, Any]) -> EgoConfig:
+    ego_type = value.get("type", "2uq2")
+    if ego_type == "2uq2":
+        expected = {"video_device", "xu_library", "calibration_id"}
+        if "type" in value:
+            expected.add("type")
+        _exact_fields(value, expected, "ego")
+        return EgoConfig(
+            type="2uq2",
+            video_device=_linux_path(value["video_device"], "ego.video_device"),
+            xu_library=_linux_path(value["xu_library"], "ego.xu_library"),
+            calibration_id=_nonempty_string(
+                value["calibration_id"], "ego.calibration_id"
+            ),
+        )
+    if ego_type == "d435i":
+        _exact_fields(value, {"type", "serial", "calibration_id"}, "ego")
+        return EgoConfig(
+            type="d435i",
+            serial=_nonempty_string(value["serial"], "ego.serial"),
+            calibration_id=_nonempty_string(
+                value["calibration_id"], "ego.calibration_id"
+            ),
+        )
+    raise ConfigError("ego.type must be 2uq2 or d435i")
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -134,9 +171,14 @@ def _object(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-def _exact_fields(value: dict[str, Any], expected: set[str], name: str) -> None:
+def _exact_fields(
+    value: dict[str, Any],
+    expected: set[str],
+    name: str,
+    optional: set[str] = frozenset(),
+) -> None:
     missing = sorted(expected - value.keys())
-    unknown = sorted(value.keys() - expected)
+    unknown = sorted(value.keys() - expected - set(optional))
     if missing:
         raise ConfigError(f"{name} missing fields: {', '.join(missing)}")
     if unknown:

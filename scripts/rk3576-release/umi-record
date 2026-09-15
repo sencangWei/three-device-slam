@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+UMI_RELEASE_ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
+export PYTHONPATH="$UMI_RELEASE_ROOT/app:$UMI_RELEASE_ROOT/runtime${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m three_device_slam.edge_rk3576.rsusb_capture "$@"

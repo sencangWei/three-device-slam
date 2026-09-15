@@ -1,0 +1,14 @@
+{
+  "schema": "three-device-slam.apriltag-print-asset.v1",
+  "role": "right",
+  "device_set_id": "UMI_DEVICE_03_CC06413A",
+  "family": "tag36h11",
+  "id": 1,
+  "effective_black_square_mm": 40.0,
+  "full_grid_with_quiet_zone_mm": 50.0,
+  "official_source_commit": "f3fd9a7add5bfd82a886fc65240fdb8e3c9ac5a1",
+  "source_pdf": "umi_device3_right_tag36h11_id1_40mm_a4.pdf",
+  "source_pdf_sha256": "79eb0a1619744008a1b7814333af5cde8aee52cf8159478d75247b8ae3c58788",
+  "print_scale": "100_percent_actual_size",
+  "physical_measurement": "PENDING"
+}

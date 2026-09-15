@@ -1,0 +1,24 @@
+{
+  "schema": "three-device-slam.print-record.v1",
+  "submitted_timestamp_local": "2026-08-27T15:00:52+08:00",
+  "completed_timestamp_local": "2026-08-27T15:01:13+08:00",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "cups_job_id": "Brother_DCP_B7530DN_series_USB-5",
+  "copies": 1,
+  "source_pdf": "umi_left_right_tag36h11_40mm_a4.pdf",
+  "source_pdf_sha256": "277ef88b553b66e63bdf4796a414971c86f8dfb3d12f69da9fe63a56ad396e70",
+  "options": {
+    "PageSize": "A4",
+    "print-scaling": "none",
+    "Duplex": "None",
+    "cupsPrintQuality": "High"
+  },
+  "cups_status": "completed",
+  "printer_status_after_job": "idle",
+  "physical_measurement": "PENDING",
+  "required_measurements": {
+    "left_black_square_mm": 40.0,
+    "right_black_square_mm": 40.0,
+    "verification_ruler_mm": 100.0
+  }
+}

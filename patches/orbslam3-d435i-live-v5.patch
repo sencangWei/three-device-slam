@@ -1,0 +1,768 @@
+diff --git a/include/ImuTypes.h b/include/ImuTypes.h
+index ac78d36..ad9c3e9 100644
+--- a/include/ImuTypes.h
++++ b/include/ImuTypes.h
+@@ -28,6 +28,7 @@
+ #include <Eigen/Dense>
+ #include <sophus/se3.hpp>
+ #include <mutex>
++#include <cmath>
+ 
+ #include "SerializationUtils.h"
+ 
+@@ -79,6 +80,13 @@ public:
+     Bias(const float &b_acc_x, const float &b_acc_y, const float &b_acc_z,
+             const float &b_ang_vel_x, const float &b_ang_vel_y, const float &b_ang_vel_z):
+             bax(b_acc_x), bay(b_acc_y), baz(b_acc_z), bwx(b_ang_vel_x), bwy(b_ang_vel_y), bwz(b_ang_vel_z){}
++    bool IsSane() const
++    {
++        return std::isfinite(bax) && std::isfinite(bay) && std::isfinite(baz)
++            && std::isfinite(bwx) && std::isfinite(bwy) && std::isfinite(bwz)
++            && bax*bax + bay*bay + baz*baz <= 100.0f
++            && bwx*bwx + bwy*bwy + bwz*bwz <= 1.0f;
++    }
+     void CopyFrom(Bias &b);
+     friend std::ostream& operator<< (std::ostream &out, const Bias &b);
+ 
+@@ -179,7 +187,7 @@ public:
+     void IntegrateNewMeasurement(const Eigen::Vector3f &acceleration, const Eigen::Vector3f &angVel, const float &dt);
+     void Reintegrate();
+     void MergePrevious(Preintegrated* pPrev);
+-    void SetNewBias(const Bias &bu_);
++    bool SetNewBias(const Bias &bu_);
+     IMU::Bias GetDeltaBias(const Bias &b_);
+ 
+     Eigen::Matrix3f GetDeltaRotation(const Bias &b_);
+diff --git a/include/LocalMapping.h b/include/LocalMapping.h
+index dd04a3d..9b3d9a1 100644
+--- a/include/LocalMapping.h
++++ b/include/LocalMapping.h
+@@ -28,6 +28,7 @@
+ #include "Settings.h"
+ 
+ #include <mutex>
++#include <atomic>
+ 
+ 
+ namespace ORB_SLAM3
+@@ -42,7 +43,11 @@ class LocalMapping
+ {
+ public:
+     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+-    LocalMapping(System* pSys, Atlas* pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName=std::string());
++    LocalMapping(System* pSys, Atlas* pAtlas, const float bMonocular, bool bInertial,
++                 float initTranslationAccumulationThreshold = 0.05f,
++                 float initTranslationResetThreshold = 0.02f,
++                 float initLowMotionResetDuration = 2.0f,
++                 const string &_strSeqName=std::string());
+ 
+     void SetLoopCloser(LoopClosing* pLoopCloser);
+ 
+@@ -77,6 +82,7 @@ public:
+     }
+ 
+     bool IsInitializing();
++    bool IsInertialBA2Complete() const;
+     double GetCurrKFTime();
+     KeyFrame* GetCurrKF();
+ 
+@@ -179,7 +185,7 @@ protected:
+     bool mbAcceptKeyFrames;
+     std::mutex mMutexAccept;
+ 
+-    void InitializeIMU(float priorG = 1e2, float priorA = 1e6, bool bFirst = false);
++    bool InitializeIMU(float priorG = 1e2, float priorA = 1e6, bool bFirst = false);
+     void ScaleRefinement();
+ 
+     bool bInitializing;
+@@ -189,6 +195,11 @@ protected:
+     int mNumKFCulling;
+ 
+     float mTinit;
++    float mInitLowMotionDuration;
++    std::atomic<bool> mbInertialBA2Completed;
++    const float mInitTranslationAccumulationThreshold;
++    const float mInitTranslationResetThreshold;
++    const float mInitLowMotionResetDuration;
+ 
+     int countRefinement;
+ 
+diff --git a/include/System.h b/include/System.h
+index 872c86e..60ec587 100644
+--- a/include/System.h
++++ b/include/System.h
+@@ -179,6 +179,7 @@ public:
+ 
+     // For debugging
+     double GetTimeFromIMUInit();
++    bool IsInertialBA2Complete();
+     bool isLost();
+     bool isFinished();
+ 
+diff --git a/src/Frame.cc b/src/Frame.cc
+index a04c312..3215be9 100644
+--- a/src/Frame.cc
++++ b/src/Frame.cc
+@@ -438,9 +438,14 @@ void Frame::SetPose(const Sophus::SE3<float> &Tcw) {
+ 
+ void Frame::SetNewBias(const IMU::Bias &b)
+ {
++    if(!b.IsSane())
++    {
++        std::cerr << "[IMU_NUMERIC_GUARD] rejected Frame bias" << std::endl;
++        return;
++    }
++    if(mpImuPreintegrated && !mpImuPreintegrated->SetNewBias(b))
++        return;
+     mImuBias = b;
+-    if(mpImuPreintegrated)
+-        mpImuPreintegrated->SetNewBias(b);
+ }
+ 
+ void Frame::SetVelocity(Eigen::Vector3f Vwb)
+diff --git a/src/ImuTypes.cc b/src/ImuTypes.cc
+index ec82cba..5b2b4a7 100644
+--- a/src/ImuTypes.cc
++++ b/src/ImuTypes.cc
+@@ -22,6 +22,8 @@
+ #include "GeometricTools.h"
+ 
+ #include<iostream>
++#include<atomic>
++#include<cmath>
+ 
+ namespace ORB_SLAM3
+ {
+@@ -36,6 +38,64 @@ Eigen::Matrix3f NormalizeRotation(const Eigen::Matrix3f &R){
+     return svd.matrixU() * svd.matrixV().transpose();
+ }
+ 
++namespace
++{
++constexpr float kMaximumGyroBiasRadS = 1.0f;
++constexpr float kMaximumAccelBiasMS2 = 10.0f;
++constexpr float kMaximumBiasRotationCorrectionRad = 1.0f;
++
++bool BiasIsSane(const Bias &bias)
++{
++    const Eigen::Vector3f gyro(bias.bwx, bias.bwy, bias.bwz);
++    const Eigen::Vector3f accel(bias.bax, bias.bay, bias.baz);
++    return gyro.allFinite() && accel.allFinite()
++        && gyro.norm() <= kMaximumGyroBiasRadS
++        && accel.norm() <= kMaximumAccelBiasMS2;
++}
++
++bool BiasDeltaIsSane(const Eigen::Vector3f &gyro,
++                     const Eigen::Vector3f &accel)
++{
++    return gyro.allFinite() && accel.allFinite()
++        && gyro.norm() <= kMaximumGyroBiasRadS
++        && accel.norm() <= kMaximumAccelBiasMS2;
++}
++
++void ReportRejectedBiasCorrection(const char *site,
++                                  const Eigen::Vector3f &gyro,
++                                  const Eigen::Vector3f &accel)
++{
++    static std::atomic<unsigned int> warning_count{0};
++    const unsigned int index = warning_count.fetch_add(1);
++    if(index < 20)
++    {
++        std::cerr << "[IMU_NUMERIC_GUARD] site=" << site
++                  << " gyro_delta=" << gyro.transpose()
++                  << " accel_delta=" << accel.transpose() << std::endl;
++    }
++}
++
++Eigen::Matrix3f CorrectedRotationOrOriginal(
++    const Eigen::Matrix3f &original,
++    const Eigen::Matrix3f &jacobian,
++    const Eigen::Vector3f &gyro_delta,
++    const char *site)
++{
++    const Eigen::Vector3f correction = jacobian * gyro_delta;
++    if(!original.allFinite() || !jacobian.allFinite()
++       || !gyro_delta.allFinite() || !correction.allFinite()
++       || correction.norm() > kMaximumBiasRotationCorrectionRad)
++    {
++        ReportRejectedBiasCorrection(
++            site, gyro_delta, Eigen::Vector3f::Zero());
++        return original.allFinite() ? original : Eigen::Matrix3f::Identity();
++    }
++    const Eigen::Matrix3f corrected =
++        original * Sophus::SO3f::exp(correction).matrix();
++    return corrected.allFinite() ? NormalizeRotation(corrected) : original;
++}
++}
++
+ Eigen::Matrix3f RightJacobianSO3(const float &x, const float &y, const float &z)
+ {
+     Eigen::Matrix3f I;
+@@ -49,6 +109,8 @@ Eigen::Matrix3f RightJacobianSO3(const float &x, const float &y, const float &z)
+         return I;
+     }
+     else {
++        if(!std::isfinite(d) || d > 1000.0f)
++            return I;
+         return I - W*(1.0f-cos(d))/d2 + W*W*(d-sin(d))/(d2*d);
+     }
+ }
+@@ -260,17 +322,25 @@ void Preintegrated::MergePrevious(Preintegrated* pPrev)
+ 
+ }
+ 
+-void Preintegrated::SetNewBias(const Bias &bu_)
++bool Preintegrated::SetNewBias(const Bias &bu_)
+ {
+     std::unique_lock<std::mutex> lock(mMutex);
++    const Eigen::Vector3f gyro_delta(
++        bu_.bwx-b.bwx, bu_.bwy-b.bwy, bu_.bwz-b.bwz);
++    const Eigen::Vector3f accel_delta(
++        bu_.bax-b.bax, bu_.bay-b.bay, bu_.baz-b.baz);
++    if(!BiasIsSane(bu_) || !BiasIsSane(b)
++       || !BiasDeltaIsSane(gyro_delta, accel_delta))
++    {
++        ReportRejectedBiasCorrection("SetNewBias", gyro_delta, accel_delta);
++        bu = b;
++        db.setZero();
++        return false;
++    }
+     bu = bu_;
+-
+-    db(0) = bu_.bwx-b.bwx;
+-    db(1) = bu_.bwy-b.bwy;
+-    db(2) = bu_.bwz-b.bwz;
+-    db(3) = bu_.bax-b.bax;
+-    db(4) = bu_.bay-b.bay;
+-    db(5) = bu_.baz-b.baz;
++    db.head(3) = gyro_delta;
++    db.tail(3) = accel_delta;
++    return true;
+ }
+ 
+ IMU::Bias Preintegrated::GetDeltaBias(const Bias &b_)
+@@ -285,7 +355,8 @@ Eigen::Matrix3f Preintegrated::GetDeltaRotation(const Bias &b_)
+     std::unique_lock<std::mutex> lock(mMutex);
+     Eigen::Vector3f dbg;
+     dbg << b_.bwx-b.bwx,b_.bwy-b.bwy,b_.bwz-b.bwz;
+-    return NormalizeRotation(dR * Sophus::SO3f::exp(JRg * dbg).matrix());
++    return CorrectedRotationOrOriginal(
++        dR, JRg, dbg, "GetDeltaRotation");
+ }
+ 
+ Eigen::Vector3f Preintegrated::GetDeltaVelocity(const Bias &b_)
+@@ -294,7 +365,14 @@ Eigen::Vector3f Preintegrated::GetDeltaVelocity(const Bias &b_)
+     Eigen::Vector3f dbg, dba;
+     dbg << b_.bwx-b.bwx,b_.bwy-b.bwy,b_.bwz-b.bwz;
+     dba << b_.bax-b.bax,b_.bay-b.bay,b_.baz-b.baz;
+-    return dV + JVg * dbg + JVa * dba;
++    if(!BiasIsSane(b_) || !BiasIsSane(b)
++       || !BiasDeltaIsSane(dbg, dba) || !JVg.allFinite() || !JVa.allFinite())
++    {
++        ReportRejectedBiasCorrection("GetDeltaVelocity", dbg, dba);
++        return dV;
++    }
++    const Eigen::Vector3f corrected = dV + JVg * dbg + JVa * dba;
++    return corrected.allFinite() ? corrected : dV;
+ }
+ 
+ Eigen::Vector3f Preintegrated::GetDeltaPosition(const Bias &b_)
+@@ -303,25 +381,49 @@ Eigen::Vector3f Preintegrated::GetDeltaPosition(const Bias &b_)
+     Eigen::Vector3f dbg, dba;
+     dbg << b_.bwx-b.bwx,b_.bwy-b.bwy,b_.bwz-b.bwz;
+     dba << b_.bax-b.bax,b_.bay-b.bay,b_.baz-b.baz;
+-    return dP + JPg * dbg + JPa * dba;
++    if(!BiasIsSane(b_) || !BiasIsSane(b)
++       || !BiasDeltaIsSane(dbg, dba) || !JPg.allFinite() || !JPa.allFinite())
++    {
++        ReportRejectedBiasCorrection("GetDeltaPosition", dbg, dba);
++        return dP;
++    }
++    const Eigen::Vector3f corrected = dP + JPg * dbg + JPa * dba;
++    return corrected.allFinite() ? corrected : dP;
+ }
+ 
+ Eigen::Matrix3f Preintegrated::GetUpdatedDeltaRotation()
+ {
+     std::unique_lock<std::mutex> lock(mMutex);
+-    return NormalizeRotation(dR * Sophus::SO3f::exp(JRg*db.head(3)).matrix());
++    return CorrectedRotationOrOriginal(
++        dR, JRg, db.head(3), "GetUpdatedDeltaRotation");
+ }
+ 
+ Eigen::Vector3f Preintegrated::GetUpdatedDeltaVelocity()
+ {
+     std::unique_lock<std::mutex> lock(mMutex);
+-    return dV + JVg * db.head(3) + JVa * db.tail(3);
++    if(!BiasDeltaIsSane(db.head(3), db.tail(3))
++       || !JVg.allFinite() || !JVa.allFinite())
++    {
++        ReportRejectedBiasCorrection(
++            "GetUpdatedDeltaVelocity", db.head(3), db.tail(3));
++        return dV;
++    }
++    const Eigen::Vector3f corrected = dV + JVg * db.head(3) + JVa * db.tail(3);
++    return corrected.allFinite() ? corrected : dV;
+ }
+ 
+ Eigen::Vector3f Preintegrated::GetUpdatedDeltaPosition()
+ {
+     std::unique_lock<std::mutex> lock(mMutex);
+-    return dP + JPg*db.head(3) + JPa*db.tail(3);
++    if(!BiasDeltaIsSane(db.head(3), db.tail(3))
++       || !JPg.allFinite() || !JPa.allFinite())
++    {
++        ReportRejectedBiasCorrection(
++            "GetUpdatedDeltaPosition", db.head(3), db.tail(3));
++        return dP;
++    }
++    const Eigen::Vector3f corrected = dP + JPg*db.head(3) + JPa*db.tail(3);
++    return corrected.allFinite() ? corrected : dP;
+ }
+ 
+ Eigen::Matrix3f Preintegrated::GetOriginalDeltaRotation() {
+diff --git a/src/KeyFrame.cc b/src/KeyFrame.cc
+index 293ab48..0c8799f 100644
+--- a/src/KeyFrame.cc
++++ b/src/KeyFrame.cc
+@@ -809,9 +809,14 @@ float KeyFrame::ComputeSceneMedianDepth(const int q)
+ void KeyFrame::SetNewBias(const IMU::Bias &b)
+ {
+     unique_lock<mutex> lock(mMutexPose);
++    if(!b.IsSane())
++    {
++        std::cerr << "[IMU_NUMERIC_GUARD] rejected KeyFrame bias" << std::endl;
++        return;
++    }
++    if(mpImuPreintegrated && !mpImuPreintegrated->SetNewBias(b))
++        return;
+     mImuBias = b;
+-    if(mpImuPreintegrated)
+-        mpImuPreintegrated->SetNewBias(b);
+ }
+ 
+ Eigen::Vector3f KeyFrame::GetGyroBias()
+diff --git a/src/LocalMapping.cc b/src/LocalMapping.cc
+index 53df332..b7f0e11 100644
+--- a/src/LocalMapping.cc
++++ b/src/LocalMapping.cc
+@@ -30,10 +30,18 @@
+ namespace ORB_SLAM3
+ {
+ 
+-LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
++LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial,
++                           float initTranslationAccumulationThreshold,
++                           float initTranslationResetThreshold,
++                           float initLowMotionResetDuration,
++                           const string &_strSeqName):
+     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
+     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
+-    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9))
++    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9)),
++    mInitLowMotionDuration(0.f), mbInertialBA2Completed(false),
++    mInitTranslationAccumulationThreshold(initTranslationAccumulationThreshold),
++    mInitTranslationResetThreshold(initTranslationResetThreshold),
++    mInitLowMotionResetDuration(initLowMotionResetDuration)
+ {
+     mnMatchesInliers = 0;
+ 
+@@ -130,12 +138,21 @@ void LocalMapping::Run()
+                     {
+                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
+                                 (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
++                        const float keyframeDt = mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
+ 
+-                        if(dist>0.05)
+-                            mTinit += mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
++                        if(dist>mInitTranslationAccumulationThreshold)
++                        {
++                            mTinit += keyframeDt;
++                            mInitLowMotionDuration = 0.f;
++                        }
++                        else if(dist<mInitTranslationResetThreshold)
++                            mInitLowMotionDuration += keyframeDt;
++                        else
++                            mInitLowMotionDuration = 0.f;
+                         if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2())
+                         {
+-                            if((mTinit<10.f) && (dist<0.02))
++                            if((mTinit<10.f) &&
++                               (mInitLowMotionDuration>mInitLowMotionResetDuration))
+                             {
+                                 cout << "Not enough motion for initializing. Reseting..." << endl;
+                                 unique_lock<mutex> lock(mMutexReset);
+@@ -205,25 +222,38 @@ void LocalMapping::Run()
+                             if (mTinit>5.0f)
+                             {
+                                 cout << "start VIBA 1" << endl;
+-                                mpCurrentKeyFrame->GetMap()->SetIniertialBA1();
++                                bool completed;
+                                 if (mbMonocular)
+-                                    InitializeIMU(1.f, 1e5, true);
++                                    completed = InitializeIMU(1.f, 1e5, true);
+                                 else
+-                                    InitializeIMU(1.f, 1e5, true);
++                                    completed = InitializeIMU(1.f, 1e5, true);
+ 
+-                                cout << "end VIBA 1" << endl;
++                                if(completed)
++                                {
++                                    mpCurrentKeyFrame->GetMap()->SetIniertialBA1();
++                                    cout << "end VIBA 1" << endl;
++                                }
++                                else
++                                    cout << "VIBA 1 did not complete" << endl;
+                             }
+                         }
+                         else if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2()){
+                             if (mTinit>15.0f){
+                                 cout << "start VIBA 2" << endl;
+-                                mpCurrentKeyFrame->GetMap()->SetIniertialBA2();
++                                bool completed;
+                                 if (mbMonocular)
+-                                    InitializeIMU(0.f, 0.f, true);
++                                    completed = InitializeIMU(0.f, 0.f, true);
+                                 else
+-                                    InitializeIMU(0.f, 0.f, true);
++                                    completed = InitializeIMU(0.f, 0.f, true);
+ 
+-                                cout << "end VIBA 2" << endl;
++                                if(completed)
++                                {
++                                    mpCurrentKeyFrame->GetMap()->SetIniertialBA2();
++                                    mbInertialBA2Completed.store(true);
++                                    cout << "end VIBA 2" << endl;
++                                }
++                                else
++                                    cout << "VIBA 2 did not complete" << endl;
+                             }
+                         }
+ 
+@@ -1055,6 +1085,7 @@ void LocalMapping::KeyFrameCulling()
+ 
+ void LocalMapping::RequestReset()
+ {
++    mbInertialBA2Completed.store(false);
+     {
+         unique_lock<mutex> lock(mMutexReset);
+         cout << "LM: Map reset recieved" << endl;
+@@ -1076,6 +1107,7 @@ void LocalMapping::RequestReset()
+ 
+ void LocalMapping::RequestResetActiveMap(Map* pMap)
+ {
++    mbInertialBA2Completed.store(false);
+     {
+         unique_lock<mutex> lock(mMutexReset);
+         cout << "LM: Active map reset recieved" << endl;
+@@ -1113,6 +1145,8 @@ void LocalMapping::ResetIfRequested()
+ 
+             // Inertial parameters
+             mTinit = 0.f;
++            mInitLowMotionDuration = 0.f;
++            mbInertialBA2Completed.store(false);
+             mbNotBA2 = true;
+             mbNotBA1 = true;
+             mbBadImu=false;
+@@ -1130,6 +1164,8 @@ void LocalMapping::ResetIfRequested()
+ 
+             // Inertial parameters
+             mTinit = 0.f;
++            mInitLowMotionDuration = 0.f;
++            mbInertialBA2Completed.store(false);
+             mbNotBA2 = true;
+             mbNotBA1 = true;
+             mbBadImu=false;
+@@ -1170,10 +1206,15 @@ bool LocalMapping::isFinished()
+     return mbFinished;
+ }
+ 
+-void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
++bool LocalMapping::IsInertialBA2Complete() const
++{
++    return mbInertialBA2Completed.load();
++}
++
++bool LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
+ {
+     if (mbResetRequested)
+-        return;
++        return false;
+ 
+     float minTime;
+     int nMinKF;
+@@ -1190,7 +1231,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
+ 
+ 
+     if(mpAtlas->KeyFramesInMap()<nMinKF)
+-        return;
++        return false;
+ 
+     // Retrieve all keyframe in temporal order
+     list<KeyFrame*> lpKF;
+@@ -1204,11 +1245,11 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
+     vector<KeyFrame*> vpKF(lpKF.begin(),lpKF.end());
+ 
+     if(vpKF.size()<nMinKF)
+-        return;
++        return false;
+ 
+     mFirstTs=vpKF.front()->mTimeStamp;
+     if(mpCurrentKeyFrame->mTimeStamp-mFirstTs<minTime)
+-        return;
++        return false;
+ 
+     bInitializing = true;
+ 
+@@ -1272,7 +1313,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
+     {
+         cout << "scale too small" << endl;
+         bInitializing=false;
+-        return;
++        return false;
+     }
+ 
+     // Before this line we are not changing the map
+@@ -1423,7 +1464,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
+ 
+     mpCurrentKeyFrame->GetMap()->IncreaseChangeIndex();
+ 
+-    return;
++    return true;
+ }
+ 
+ void LocalMapping::ScaleRefinement()
+diff --git a/src/Optimizer.cc b/src/Optimizer.cc
+index b785be3..a884d48 100644
+--- a/src/Optimizer.cc
++++ b/src/Optimizer.cc
+@@ -4826,7 +4826,9 @@ int Optimizer::PoseInertialOptimizationLastKeyFrame(Frame *pFrame, bool bRecInit
+     pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
+     Vector6d b;
+     b << VG->estimate(), VA->estimate();
+-    pFrame->mImuBias = IMU::Bias(b[3],b[4],b[5],b[0],b[1],b[2]);
++    const IMU::Bias optimizedBias(b[3],b[4],b[5],b[0],b[1],b[2]);
++    if(optimizedBias.IsSane())
++        pFrame->mImuBias = optimizedBias;
+ 
+     // Recover Hessian, marginalize keyFframe states and generate new prior for frame
+     Eigen::Matrix<double,15,15> H;
+@@ -5227,7 +5229,9 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
+     pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
+     Vector6d b;
+     b << VG->estimate(), VA->estimate();
+-    pFrame->mImuBias = IMU::Bias(b[3],b[4],b[5],b[0],b[1],b[2]);
++    const IMU::Bias optimizedBias(b[3],b[4],b[5],b[0],b[1],b[2]);
++    if(optimizedBias.IsSane())
++        pFrame->mImuBias = optimizedBias;
+ 
+     // Recover Hessian, marginalize previous frame states and generate new prior for frame
+     Eigen::Matrix<double,30,30> H;
+diff --git a/src/Settings.cc b/src/Settings.cc
+index 93a50be..8a71b63 100644
+--- a/src/Settings.cc
++++ b/src/Settings.cc
+@@ -559,8 +559,13 @@ namespace ORB_SLAM3 {
+                 output << "Kannala-Brandt";
+             }
+             output << "" << ": [";
+-            for(size_t i = 0; i < settings.originalCalib2_->size(); i++){
+-                output << " " << settings.originalCalib2_->getParameter(i);
++            // Rectified stereo uses the shared Camera1 model and therefore does
++            // not allocate originalCalib2_. Print that shared model instead.
++            GeometricCamera* originalCalib2 =
++                settings.cameraType_ == Settings::Rectified
++                    ? settings.originalCalib1_ : settings.originalCalib2_;
++            for(size_t i = 0; i < originalCalib2->size(); i++){
++                output << " " << originalCalib2->getParameter(i);
+             }
+             output << " ]" << endl;
+ 
+diff --git a/src/System.cc b/src/System.cc
+index 60d9c51..5317785 100644
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -23,6 +23,7 @@
+ #include <thread>
+ #include <pangolin/pangolin.h>
+ #include <iomanip>
++#include <cmath>
+ #include <openssl/md5.h>
+ #include <boost/serialization/base_object.hpp>
+ #include <boost/serialization/string.hpp>
+@@ -105,6 +106,36 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
+         activeLC = static_cast<int>(fsSettings["loopClosing"]) != 0;
+     }
+ 
++    float initTranslationAccumulationThreshold = 0.05f;
++    float initTranslationResetThreshold = 0.02f;
++    float initLowMotionResetDuration = 2.0f;
++    node = fsSettings["IMU.InitTranslationAccumulationThreshold"];
++    if(!node.empty())
++        initTranslationAccumulationThreshold = static_cast<float>(node);
++    node = fsSettings["IMU.InitTranslationResetThreshold"];
++    if(!node.empty())
++        initTranslationResetThreshold = static_cast<float>(node);
++    node = fsSettings["IMU.InitLowMotionResetDuration"];
++    if(!node.empty())
++        initLowMotionResetDuration = static_cast<float>(node);
++    if(!std::isfinite(initTranslationAccumulationThreshold) ||
++       !std::isfinite(initTranslationResetThreshold) ||
++       !std::isfinite(initLowMotionResetDuration) ||
++       initTranslationResetThreshold < 0.f ||
++       initTranslationAccumulationThreshold <= initTranslationResetThreshold ||
++       initLowMotionResetDuration <= 0.f)
++    {
++        cerr << "Invalid IMU initialization translation thresholds" << endl;
++        exit(-1);
++    }
++    if(mSensor==IMU_STEREO || mSensor==IMU_MONOCULAR || mSensor==IMU_RGBD)
++    {
++        cout << "IMU initialization translation thresholds: accumulate="
++             << initTranslationAccumulationThreshold << " m, reset="
++             << initTranslationResetThreshold << " m, low-motion grace="
++             << initLowMotionResetDuration << " s" << endl;
++    }
++
+     mStrVocabularyFilePath = strVocFile;
+ 
+     bool loadedAtlas = false;
+@@ -193,7 +224,10 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
+ 
+     //Initialize the Local Mapping thread and launch
+     mpLocalMapper = new LocalMapping(this, mpAtlas, mSensor==MONOCULAR || mSensor==IMU_MONOCULAR,
+-                                     mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD, strSequence);
++                                     mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD,
++                                     initTranslationAccumulationThreshold,
++                                     initTranslationResetThreshold,
++                                     initLowMotionResetDuration, strSequence);
+     mptLocalMapping = new thread(&ORB_SLAM3::LocalMapping::Run,mpLocalMapper);
+     mpLocalMapper->mInitFr = initFr;
+     if(settings_)
+@@ -530,20 +564,20 @@ void System::Shutdown()
+             usleep(5000);
+     }*/
+ 
+-    // Wait until all thread have effectively stopped
+-    /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
++    // Wait until all worker threads have effectively stopped before serializing
++    // the Atlas or walking trajectory containers.  The upstream wait was
++    // commented out, which permits a live shutdown to race LocalMapping.
++    while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
+     {
+         if(!mpLocalMapper->isFinished())
+-            cout << "mpLocalMapper is not finished" << endl;*/
+-        /*if(!mpLoopCloser->isFinished())
++            cout << "mpLocalMapper is not finished" << endl;
++        if(!mpLoopCloser->isFinished())
+             cout << "mpLoopCloser is not finished" << endl;
+         if(mpLoopCloser->isRunningGBA()){
+             cout << "mpLoopCloser is running GBA" << endl;
+-            cout << "break anyway..." << endl;
+-            break;
+-        }*/
+-        /*usleep(5000);
+-    }*/
++        }
++        usleep(5000);
++    }
+ 
+     if(!mStrSaveAtlasToFile.empty())
+     {
+@@ -1345,6 +1379,14 @@ double System::GetTimeFromIMUInit()
+         return 0.f;
+ }
+ 
++bool System::IsInertialBA2Complete()
++{
++    Map* currentMap = mpAtlas->GetCurrentMap();
++    return mpLocalMapper != nullptr &&
++           mpLocalMapper->IsInertialBA2Complete() &&
++           currentMap != nullptr && currentMap->GetIniertialBA2();
++}
++
+ bool System::isLost()
+ {
+     if (!mpAtlas->isImuInitialized())
+@@ -1546,4 +1588,3 @@ string System::CalculateCheckSum(string filename, int type)
+ }
+ 
+ } //namespace ORB_SLAM
+-
+diff --git a/src/Tracking.cc b/src/Tracking.cc
+index 5191451..fe09b88 100644
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -1675,8 +1675,11 @@ void Tracking::PreintegrateIMU()
+     }
+ 
+     const int n = mvImuFromLastFrame.size()-1;
+-    if(n==0){
+-        cout << "Empty IMU measurements vector!!!\n";
++    if(n<=0){
++        Verbose::PrintMess("Insufficient IMU measurements for frame preintegration", Verbose::VERBOSITY_NORMAL);
++        // Leave prediction unavailable for this frame; the visual motion
++        // model in TrackWithMotionModel will provide the bounded fallback.
++        mCurrentFrame.setIntegrated();
+         return;
+     }
+ 
+@@ -1745,6 +1748,12 @@ bool Tracking::PredictStateIMU()
+ 
+     if(mbMapUpdated && mpLastKeyFrame)
+     {
++        if(!mpImuPreintegratedFromLastKF)
++        {
++            Verbose::PrintMess("Missing IMU preintegration from last keyframe", Verbose::VERBOSITY_NORMAL);
++            return false;
++        }
++
+         const Eigen::Vector3f twb1 = mpLastKeyFrame->GetImuPosition();
+         const Eigen::Matrix3f Rwb1 = mpLastKeyFrame->GetImuRotation();
+         const Eigen::Vector3f Vwb1 = mpLastKeyFrame->GetVelocity();
+@@ -1763,6 +1772,12 @@ bool Tracking::PredictStateIMU()
+     }
+     else if(!mbMapUpdated)
+     {
++        if(!mCurrentFrame.mpImuPreintegratedFrame)
++        {
++            Verbose::PrintMess("Missing IMU preintegration from last frame", Verbose::VERBOSITY_NORMAL);
++            return false;
++        }
++
+         const Eigen::Vector3f twb1 = mLastFrame.GetImuPosition();
+         const Eigen::Matrix3f Rwb1 = mLastFrame.GetImuRotation();
+         const Eigen::Vector3f Vwb1 = mLastFrame.GetVelocity();
+@@ -1986,7 +2001,7 @@ void Tracking::Track()
+                     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))
+                     {
+                         if(pCurrentMap->isImuInitialized())
+-                            PredictStateIMU();
++                            bOK = PredictStateIMU();
+                         else
+                             bOK = false;
+ 
+@@ -2861,15 +2876,16 @@ bool Tracking::TrackWithMotionModel()
+ 
+     if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU))
+     {
+-        // Predict state with IMU if it is initialized and it doesnt need reset
+-        PredictStateIMU();
+-        return true;
+-    }
+-    else
+-    {
+-        mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
++        // Predict state with IMU when the frame has a valid integration.
++        // A short live scheduling gap can leave a frame without enough IMU
++        // samples; fall through to the visual motion model in that case.
++        if(PredictStateIMU())
++            return true;
++        Verbose::PrintMess("Falling back to visual motion model for one frame", Verbose::VERBOSITY_NORMAL);
+     }
+ 
++    mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
++
+ 
+ 
+ 

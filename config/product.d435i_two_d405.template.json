@@ -1,0 +1,22 @@
+{
+  "schema": "three-device-slam.product-config.v1",
+  "left": {
+    "serial": "REPLACE_WITH_LEFT_D405_SERIAL",
+    "imu_path": "/dev/serial/by-id/REPLACE_WITH_LEFT_IMU_BY_ID",
+    "calibration_id": "REPLACE_WITH_LEFT_CALIBRATION_ID",
+    "imu_protocol": "stm32_combined_v1"
+  },
+  "right": {
+    "serial": "REPLACE_WITH_RIGHT_D405_SERIAL",
+    "imu_path": "/dev/serial/by-id/REPLACE_WITH_RIGHT_IMU_BY_ID",
+    "calibration_id": "REPLACE_WITH_RIGHT_CALIBRATION_ID",
+    "imu_protocol": "stm32_combined_v1"
+  },
+  "ego": {
+    "type": "d435i",
+    "serial": "327122078613",
+    "calibration_id": "D435I_FACTORY_327122078613_20260828"
+  },
+  "output_root": "/home/robot/three-device-slam/artifacts/product_sessions",
+  "duration_s": 30.0
+}

@@ -1,0 +1,124 @@
+diff --git a/include/LocalMapping.h b/include/LocalMapping.h
+index dd04a3d..9974531 100644
+--- a/include/LocalMapping.h
++++ b/include/LocalMapping.h
+@@ -42,7 +42,10 @@ class LocalMapping
+ {
+ public:
+     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+-    LocalMapping(System* pSys, Atlas* pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName=std::string());
++    LocalMapping(System* pSys, Atlas* pAtlas, const float bMonocular, bool bInertial,
++                 float initTranslationAccumulationThreshold = 0.05f,
++                 float initTranslationResetThreshold = 0.02f,
++                 const string &_strSeqName=std::string());
+ 
+     void SetLoopCloser(LoopClosing* pLoopCloser);
+ 
+@@ -189,6 +192,8 @@ protected:
+     int mNumKFCulling;
+ 
+     float mTinit;
++    const float mInitTranslationAccumulationThreshold;
++    const float mInitTranslationResetThreshold;
+ 
+     int countRefinement;
+ 
+diff --git a/src/LocalMapping.cc b/src/LocalMapping.cc
+index 53df332..1ebbce2 100644
+--- a/src/LocalMapping.cc
++++ b/src/LocalMapping.cc
+@@ -30,10 +30,15 @@
+ namespace ORB_SLAM3
+ {
+ 
+-LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
++LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial,
++                           float initTranslationAccumulationThreshold,
++                           float initTranslationResetThreshold,
++                           const string &_strSeqName):
+     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
+     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
+-    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9))
++    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9)),
++    mInitTranslationAccumulationThreshold(initTranslationAccumulationThreshold),
++    mInitTranslationResetThreshold(initTranslationResetThreshold)
+ {
+     mnMatchesInliers = 0;
+ 
+@@ -131,11 +136,11 @@ void LocalMapping::Run()
+                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
+                                 (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
+ 
+-                        if(dist>0.05)
++                        if(dist>mInitTranslationAccumulationThreshold)
+                             mTinit += mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
+                         if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2())
+                         {
+-                            if((mTinit<10.f) && (dist<0.02))
++                            if((mTinit<10.f) && (dist<mInitTranslationResetThreshold))
+                             {
+                                 cout << "Not enough motion for initializing. Reseting..." << endl;
+                                 unique_lock<mutex> lock(mMutexReset);
+diff --git a/src/Settings.cc b/src/Settings.cc
+index 93a50be..8a71b63 100644
+--- a/src/Settings.cc
++++ b/src/Settings.cc
+@@ -559,8 +559,13 @@ namespace ORB_SLAM3 {
+                 output << "Kannala-Brandt";
+             }
+             output << "" << ": [";
+-            for(size_t i = 0; i < settings.originalCalib2_->size(); i++){
+-                output << " " << settings.originalCalib2_->getParameter(i);
++            // Rectified stereo uses the shared Camera1 model and therefore does
++            // not allocate originalCalib2_. Print that shared model instead.
++            GeometricCamera* originalCalib2 =
++                settings.cameraType_ == Settings::Rectified
++                    ? settings.originalCalib1_ : settings.originalCalib2_;
++            for(size_t i = 0; i < originalCalib2->size(); i++){
++                output << " " << originalCalib2->getParameter(i);
+             }
+             output << " ]" << endl;
+ 
+diff --git a/src/System.cc b/src/System.cc
+index 60d9c51..b24f066 100644
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -105,6 +105,27 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
+         activeLC = static_cast<int>(fsSettings["loopClosing"]) != 0;
+     }
+ 
++    float initTranslationAccumulationThreshold = 0.05f;
++    float initTranslationResetThreshold = 0.02f;
++    node = fsSettings["IMU.InitTranslationAccumulationThreshold"];
++    if(!node.empty())
++        initTranslationAccumulationThreshold = static_cast<float>(node);
++    node = fsSettings["IMU.InitTranslationResetThreshold"];
++    if(!node.empty())
++        initTranslationResetThreshold = static_cast<float>(node);
++    if(initTranslationResetThreshold < 0.f ||
++       initTranslationAccumulationThreshold <= initTranslationResetThreshold)
++    {
++        cerr << "Invalid IMU initialization translation thresholds" << endl;
++        exit(-1);
++    }
++    if(mSensor==IMU_STEREO || mSensor==IMU_MONOCULAR || mSensor==IMU_RGBD)
++    {
++        cout << "IMU initialization translation thresholds: accumulate="
++             << initTranslationAccumulationThreshold << " m, reset="
++             << initTranslationResetThreshold << " m" << endl;
++    }
++
+     mStrVocabularyFilePath = strVocFile;
+ 
+     bool loadedAtlas = false;
+@@ -193,7 +214,9 @@ System::System(const string &strVocFile, const string &strSettingsFile, const eS
+ 
+     //Initialize the Local Mapping thread and launch
+     mpLocalMapper = new LocalMapping(this, mpAtlas, mSensor==MONOCULAR || mSensor==IMU_MONOCULAR,
+-                                     mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD, strSequence);
++                                     mSensor==IMU_MONOCULAR || mSensor==IMU_STEREO || mSensor==IMU_RGBD,
++                                     initTranslationAccumulationThreshold,
++                                     initTranslationResetThreshold, strSequence);
+     mptLocalMapping = new thread(&ORB_SLAM3::LocalMapping::Run,mpLocalMapper);
+     mpLocalMapper->mInitFr = initFr;
+     if(settings_)

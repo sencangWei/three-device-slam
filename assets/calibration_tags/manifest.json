@@ -1,0 +1,26 @@
+{
+  "schema": "three-device-slam.apriltag-print-assets.v1",
+  "family": "tag36h11",
+  "official_source": "https://github.com/AprilRobotics/apriltag-imgs",
+  "official_source_commit": "f3fd9a7add5bfd82a886fc65240fdb8e3c9ac5a1",
+  "effective_black_square_mm": 40.0,
+  "full_grid_with_quiet_zone_mm": 50.0,
+  "tags": {
+    "left": {
+      "id": 0,
+      "official_png_sha256": "48d811f770fc3595aaf5650a5fd8007843e7fece1f8fdcb94e0f113b4c9ed0c6"
+    },
+    "right": {
+      "id": 1,
+      "official_png_sha256": "2b30c316b3f8f32d80ba4e83feee8471c41a04aeba75bf1a23f1cf9c990394ce"
+    }
+  },
+  "files": [
+    "umi_left_tag36h11_id0_40mm.png",
+    "umi_left_tag36h11_id0_40mm.svg",
+    "umi_right_tag36h11_id1_40mm.png",
+    "umi_right_tag36h11_id1_40mm.svg",
+    "umi_left_right_tag36h11_40mm_a4.pdf"
+  ],
+  "verification": "OpenCV DICT_APRILTAG_36h11 decoded each generated PNG to its expected ID"
+}

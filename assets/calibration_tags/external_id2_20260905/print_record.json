@@ -1,0 +1,23 @@
+{
+  "schema": "three-device-slam.print-record.v1",
+  "verified_timestamp_local": "2026-09-05T17:30:10+08:00",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "cups_job_id": "Brother_DCP_B7530DN_series_USB-9",
+  "copies": 1,
+  "source_pdf": "external_tag36h11_id2_40mm_a4.pdf",
+  "source_pdf_sha256": "570c4992551c2b3e2adc8d7ccf1cac32c0bd60339791620de9dbab93c9ed1ea4",
+  "options": {
+    "PageSize": "A4",
+    "print-scaling": "none",
+    "Duplex": "None",
+    "cupsPrintQuality": "High"
+  },
+  "cups_status": "completed",
+  "printer_status_after_job": "idle",
+  "digital_pdf_decode": 2,
+  "pdf_raster_black_square_mm": 39.93,
+  "nominal_black_square_mm": 40.0,
+  "white_margin_mm": 10.0,
+  "physical_measurement": "PENDING",
+  "note": "New external tag ID2; existing live preview still expects external IDs 0/1 until reconfigured. Use crosscheck --mount-id 1 --ext0-id 0 --ext1-id 2 after replacing external ID1."
+}

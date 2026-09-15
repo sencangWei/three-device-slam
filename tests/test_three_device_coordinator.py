@@ -1399,6 +1399,381 @@ def test_worker_commands_omit_duration_when_config_has_none(tmp_path):
     assert all("--duration" not in command for command in commands.values())
 
 
+def test_worker_commands_select_explicit_d435i_ego(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(serial="left-serial", imu_path="/dev/left-imu"),
+        right=SimpleNamespace(serial="right-serial", imu_path="/dev/right-imu"),
+        ego=SimpleNamespace(
+            type="d435i",
+            serial="327122078613",
+            calibration_id="d435i-cal-v1",
+        ),
+        duration_s=10.0,
+        output_root=tmp_path,
+    )
+    session = tmp_path / "session"
+
+    command = coordinator._build_worker_commands(config, session)["ego"]
+
+    assert command[:3] == [
+        coordinator.sys.executable,
+        "-m",
+        "three_device_slam.devices.d435i_ego.worker",
+    ]
+    assert command[command.index("--serial") + 1] == "327122078613"
+    assert command[command.index("--calibration-id") + 1] == "d435i-cal-v1"
+    assert command[command.index("--session") + 1] == str(session)
+    assert command[command.index("--barrier-dir") + 1] == str(session / "barrier")
+    assert "--no-preview" not in command
+
+
+def test_d435i_product_builds_one_rsusb_owner_command_for_all_three_devices(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left-serial",
+            imu_path="/dev/left-imu",
+            imu_protocol="stm32_combined_v1",
+            calibration_id="left-cal",
+        ),
+        right=SimpleNamespace(
+            serial="right-serial",
+            imu_path="/dev/right-imu",
+            imu_protocol="kt_ex9_37",
+            calibration_id="right-cal",
+        ),
+        ego=SimpleNamespace(
+            type="d435i",
+            serial="ego-serial",
+            calibration_id="ego-cal",
+        ),
+        duration_s=10.0,
+        output_root=tmp_path,
+    )
+
+    command = coordinator._build_rsusb_owner_command(config, tmp_path / "session")
+
+    assert command[:3] == [
+        coordinator.sys.executable,
+        "-m",
+        "three_device_slam.acquisition.rsusb_pair",
+    ]
+    assert command[command.index("--ego-serial") + 1] == "ego-serial"
+    assert command[command.index("--umi-serial") + 1] == "left-serial"
+    assert command[command.index("--right-serial") + 1] == "right-serial"
+    assert command[command.index("--right-port") + 1] == "/dev/right-imu"
+    assert command.count("three_device_slam.devices.d405_umi.worker") == 0
+
+
+def test_d435i_product_capture_routes_to_single_owner(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left-serial", imu_path="/dev/left", calibration_id="left-cal",
+            imu_protocol="stm32_combined_v1",
+        ),
+        right=SimpleNamespace(
+            serial="right-serial", imu_path="/dev/right", calibration_id="right-cal",
+            imu_protocol="stm32_combined_v1",
+        ),
+        ego=SimpleNamespace(
+            type="d435i", serial="ego-serial", calibration_id="ego-cal"
+        ),
+        duration_s=3.0,
+        output_root=tmp_path,
+    )
+    session = tmp_path / "single-owner-session"
+    expected = {"status": "BLOCKED", "reason": "test-boundary"}
+    monkeypatch.setattr(coordinator, "_new_session", lambda _root: session)
+    monkeypatch.setattr(
+        coordinator,
+        "_run_rsusb_owner_capture",
+        lambda observed_config, observed_session, stop: (
+            expected
+            if observed_config is config and observed_session == session and not stop()
+            else pytest.fail("wrong single-owner inputs")
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_coordinator",
+        lambda *_args, **_kwargs: pytest.fail("three worker coordinator must not run"),
+    )
+
+    result = coordinator.run_product_capture(config, lambda: False)
+
+    assert result.session == session
+    assert result.report == expected
+
+
+def test_rsusb_owner_rejects_auto_protocol_before_hardware_start(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left", imu_path="/dev/left", calibration_id="left-cal",
+            imu_protocol="auto",
+        ),
+        right=SimpleNamespace(
+            serial="right", imu_path="/dev/right", calibration_id="right-cal",
+            imu_protocol="stm32_combined_v1",
+        ),
+        ego=SimpleNamespace(type="d435i", serial="ego", calibration_id="ego-cal"),
+        duration_s=3.0,
+    )
+
+    with pytest.raises(ValueError, match="explicit UMI protocols"):
+        coordinator._build_rsusb_owner_command(config, tmp_path / "session")
+
+
+def test_d435i_single_umi_builds_owner_command_without_right(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left-serial",
+            imu_path="/dev/left-imu",
+            imu_protocol="stm32_combined_v1",
+            calibration_id="left-cal",
+        ),
+        right=None,
+        ego=SimpleNamespace(type="d435i", serial="ego-serial", calibration_id="ego-cal"),
+        duration_s=10.0,
+        output_root=tmp_path,
+    )
+
+    command = coordinator._build_rsusb_owner_command(config, tmp_path / "session")
+
+    assert "--right-serial" not in command
+    assert "--right-port" not in command
+    assert command[command.index("--umi-serial") + 1] == "left-serial"
+    assert command[command.index("--umi-protocol") + 1] == "stm32_combined_v1"
+    assert command[command.index("--duration") + 1] == "10.0"
+    assert coordinator._capture_devices(config) == ("ego", "left")
+    assert coordinator._capture_topology(config) == "single_umi"
+
+
+def test_d435i_right_only_builds_owner_command_with_right_role(tmp_path):
+    config = SimpleNamespace(
+        left=None,
+        right=SimpleNamespace(
+            serial="right-serial",
+            imu_path="/dev/right-imu",
+            imu_protocol="stm32_combined_v1",
+            calibration_id="right-cal",
+        ),
+        ego=SimpleNamespace(type="d435i", serial="ego-serial", calibration_id="ego-cal"),
+        duration_s=10.0,
+        output_root=tmp_path,
+    )
+
+    command = coordinator._build_rsusb_owner_command(config, tmp_path / "session")
+
+    assert command[command.index("--umi-device-id") + 1] == "right"
+    assert command[command.index("--umi-serial") + 1] == "right-serial"
+    assert "--right-serial" not in command
+    assert coordinator._capture_devices(config) == ("ego", "right")
+    assert coordinator._capture_topology(config) == "single_umi"
+
+
+def test_d435i_single_umi_terminal_report_covers_only_present_devices(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left", imu_path="/dev/left", calibration_id="left-cal",
+            imu_protocol="stm32_combined_v1",
+        ),
+        right=None,
+        ego=SimpleNamespace(type="d435i", serial="ego", calibration_id="ego-cal"),
+        duration_s=3.0,
+    )
+    command = ["python", "-m", "three_device_slam.acquisition.rsusb_pair"]
+    session = tmp_path / "session"
+
+    report = coordinator._single_owner_terminal_report(
+        session,
+        command,
+        status="BLOCKED",
+        reason="required_hardware_unavailable",
+        expected_calibration_ids={"ego": "ego-cal", "left": "left-cal"},
+        devices=coordinator._capture_devices(config),
+        topology=coordinator._capture_topology(config),
+    )
+
+    assert report["capture_topology"] == "single_umi"
+    assert set(report["workers"]) == {"ego", "left"}
+    assert set(report["calibration_expectations"]) == {"ego", "left"}
+
+
+def test_d435i_single_umi_coordinator_report_marks_topology(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left", imu_path="/dev/left", calibration_id="left-cal",
+            imu_protocol="stm32_combined_v1",
+        ),
+        right=None,
+        ego=SimpleNamespace(type="d435i", serial="ego", calibration_id="ego-cal"),
+        duration_s=3.0,
+    )
+    group = {
+        "schema": "ego.rsusb_pair.acceptance.v2",
+        "status": "PASS",
+        "formal_start_ns": 1_000,
+        "formal_end_ns": 4_000_000_000_000,
+        "warmup_started_ns": 500,
+        "joint_ready_ns": 900,
+    }
+    acceptances = {
+        "ego": {
+            "schema": "ego.d435i.acceptance.v1",
+            "status": "PASS",
+            "calibration_id": "ego-cal",
+            "formal_evidence": {"first_acquisition_ns": 1_200},
+        },
+        "left": {
+            "schema": "umi.d405.append_only.acceptance.v1",
+            "result": "PASS",
+            "live_vins": {"imu_calibration": "left-cal"},
+        },
+    }
+    command = ["python", "-m", "three_device_slam.acquisition.rsusb_pair"]
+
+    report = coordinator._single_owner_coordinator_report(
+        tmp_path / "session",
+        command,
+        group,
+        acceptances,
+        [],
+        {"ego": "ego-cal", "left": "left-cal"},
+        devices=coordinator._capture_devices(config),
+        topology=coordinator._capture_topology(config),
+    )
+
+    assert report["status"] == "PASS"
+    assert report["capture_topology"] == "single_umi"
+    assert set(report["workers"]) == {"ego", "left"}
+    assert report["task_start_ego_frame_ns"] == 1_200
+    expectations = report["calibration_expectations"]
+    assert expectations["ego"]["status"] == "PASS"
+    assert expectations["left"]["status"] == "PASS"
+
+
+def test_single_owner_group_adapts_to_formal_coordinator_report(tmp_path):
+    start = 10_000_000_000
+    acceptances = {
+        "ego": {
+            "schema": "ego.d435i.acceptance.v1",
+            "status": "PASS",
+            "calibration_id": "ego-cal",
+            "formal_evidence": {"first_acquisition_ns": start + 1},
+        },
+        "left": {
+            "schema": "umi.d405.append_only.acceptance.v1",
+            "result": "PASS",
+            "live_vins": {"imu_calibration": "left-cal"},
+        },
+        "right": {
+            "schema": "umi.d405.append_only.acceptance.v1",
+            "result": "PASS",
+            "live_vins": {"imu_calibration": "right-cal"},
+        },
+    }
+    report = coordinator._single_owner_coordinator_report(
+        tmp_path,
+        ["python", "-m", "three_device_slam.acquisition.rsusb_pair"],
+        {
+            "status": "PASS",
+            "warmup_started_ns": start - 4_000_000_000,
+            "joint_ready_ns": start - 500_000_000,
+            "formal_start_ns": start,
+            "formal_end_ns": start + 3_000_000_000,
+        },
+        acceptances,
+        [],
+        {"ego": "ego-cal", "left": "left-cal", "right": "right-cal"},
+    )
+
+    assert report["status"] == "PASS"
+    assert report["task_start_ego_frame_ns"] == start + 1
+    assert report["transitions"][1] == {
+        "state": "JOINT_READY",
+        "at_ns": start - 500_000_000,
+    }
+    assert report["owner_model"] == (
+        "single_process_single_thread_realsense_lifecycle"
+    )
+    assert all(item["exit_code"] == 0 for item in report["workers"].values())
+    assert all(
+        item["status"] == "PASS"
+        for item in report["calibration_expectations"].values()
+    )
+
+
+def test_single_owner_report_never_synthesizes_missing_joint_ready_time(tmp_path):
+    start = 10_000_000_000
+    acceptances = {
+        "ego": {
+            "schema": "ego.d435i.acceptance.v1",
+            "status": "PASS",
+            "calibration_id": "ego-cal",
+            "formal_evidence": {"first_acquisition_ns": start + 1},
+        },
+        "left": {"result": "PASS", "live_vins": {"imu_calibration": "left-cal"}},
+        "right": {"result": "PASS", "live_vins": {"imu_calibration": "right-cal"}},
+    }
+
+    report = coordinator._single_owner_coordinator_report(
+        tmp_path,
+        ["owner"],
+        {
+            "status": "PASS",
+            "formal_start_ns": start,
+            "formal_end_ns": start + 1_000_000_000,
+        },
+        acceptances,
+        [],
+        {"ego": "ego-cal", "left": "left-cal", "right": "right-cal"},
+    )
+
+    assert report["status"] == "FAIL"
+    assert not any(
+        transition["state"] == "JOINT_READY"
+        for transition in report["transitions"]
+    )
+
+
+def test_worker_commands_pin_configured_d405_imu_protocol(tmp_path):
+    config = SimpleNamespace(
+        left=SimpleNamespace(
+            serial="left-serial",
+            imu_path="/dev/left-imu",
+            imu_protocol="stm32_combined_v1",
+        ),
+        right=SimpleNamespace(
+            serial="right-serial",
+            imu_path="/dev/right-imu",
+            imu_protocol="kt_ex9_37",
+        ),
+        ego=SimpleNamespace(video_device="/dev/video0", xu_library="/opt/libxu.so"),
+        duration_s=1.0,
+        output_root=tmp_path,
+    )
+
+    commands = coordinator._build_worker_commands(config, tmp_path / "session")
+
+    assert commands["left"][commands["left"].index("--imu-protocol") + 1] == (
+        "stm32_combined_v1"
+    )
+    assert commands["right"][commands["right"].index("--imu-protocol") + 1] == (
+        "kt_ex9_37"
+    )
+
+
+def test_coordinator_accepts_d435i_ego_acceptance_schema():
+    payload = {
+        "schema": "ego.d435i.acceptance.v1",
+        "status": "PASS",
+        "calibration_id": "d435i-cal-v1",
+        "formal_evidence": {"first_acquisition_ns": 123},
+        "hashes": {},
+    }
+
+    assert coordinator._validated_acceptance_status("ego", payload) == "PASS"
+
+
 def test_run_product_capture_returns_created_session_and_report(tmp_path, monkeypatch):
     config = SimpleNamespace(
         left=SimpleNamespace(

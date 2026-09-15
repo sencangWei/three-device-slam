@@ -1,0 +1,21 @@
+{
+  "schema": "three-device-slam.device3-world-runtime-profile.v1",
+  "profile_id": "DEVICE3_RIGHT_WORLD_RUNTIME_PAIR_V1_20260915",
+  "enabled": true,
+  "scope": "ego_plus_right_only",
+  "frame_convention": "T_A_B maps coordinates in frame B into frame A",
+  "identities": {
+    "ego_d435i_serial": "327122078613",
+    "right_d405_serial": "260422274454",
+    "right_imu_path": "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_cc06413ab505f0118b03921272aab386-if00-port0"
+  },
+  "accepted_calibration": {
+    "path": "/home/robot/three-device-slam/artifacts/shared_world_device3_recovery_20260914/device3_right_world_mount_accepted_20260914.json",
+    "sha256": "59c4aebe5a59726b0f3224cb21b6a26f7d9930b755e0a414a61028fd6641bf49"
+  },
+  "accepted_package_manifest": {
+    "path": "/home/robot/three-device-slam/artifacts/shared_world_device3_recovery_20260914/device3_right_world_mount_accepted_package_manifest_20260914.json",
+    "sha256": "16654f3679105850726840ac78670964a2d9ad002d7ea640cb861a59aa0aa954"
+  },
+  "three_device_group_ready": false
+}

@@ -926,7 +926,10 @@ def _validated_acceptance_status(device_id: str, acceptance) -> str | None:
     ):
         return None
     if device_id == "ego":
-        if acceptance.get("schema") != "ego.2uq2.acceptance.v1":
+        if acceptance.get("schema") not in {
+            "ego.2uq2.acceptance.v1",
+            "ego.d435i.acceptance.v1",
+        }:
             return None
         if any(
             key in acceptance and not isinstance(acceptance[key], Mapping)
@@ -987,9 +990,9 @@ def _task_start_ego_frame_ns(acceptance, scheduled_start_ns):
     return candidate if candidate >= scheduled_start_ns else None
 
 
-def _calibration_evidence_ids(acceptances):
+def _calibration_evidence_ids(acceptances, devices=REQUIRED_DEVICES):
     result = {}
-    for device in REQUIRED_DEVICES:
+    for device in devices:
         acceptance = acceptances.get(device, {})
         if not isinstance(acceptance, Mapping):
             acceptance = {}
@@ -1015,14 +1018,17 @@ def _calibration_evidence_ids(acceptances):
     return result
 
 
-def _validate_calibration_expectations(expected_calibration_ids) -> None:
+def _validate_calibration_expectations(
+    expected_calibration_ids, devices=REQUIRED_DEVICES
+) -> None:
     if expected_calibration_ids is None:
         return
     if not isinstance(expected_calibration_ids, Mapping) or set(
         expected_calibration_ids
-    ) != set(REQUIRED_DEVICES):
+    ) != set(devices):
         raise ValueError(
-            "expected calibration IDs must contain exactly ego, left, and right"
+            "expected calibration IDs must contain exactly "
+            + ", ".join(devices)
         )
     if any(
         not isinstance(value, str) or not value.strip()
@@ -1031,11 +1037,13 @@ def _validate_calibration_expectations(expected_calibration_ids) -> None:
         raise ValueError("expected calibration IDs must be non-empty strings")
 
 
-def _calibration_expectations(expected_calibration_ids, acceptances):
+def _calibration_expectations(
+    expected_calibration_ids, acceptances, devices=REQUIRED_DEVICES
+):
     if expected_calibration_ids is None:
         return None
     result = {}
-    for device in REQUIRED_DEVICES:
+    for device in devices:
         acceptance = acceptances.get(device)
         observed = None
         if isinstance(acceptance, Mapping):
@@ -1208,6 +1216,8 @@ def _build_worker_commands(config, session: Path):
             serial,
             "--imu-port",
             imu_path,
+            "--imu-protocol",
+            getattr(getattr(config, device), "imu_protocol", "auto"),
             "--device-id",
             device,
             "--session",
@@ -1217,26 +1227,302 @@ def _build_worker_commands(config, session: Path):
             "--no-ram-stage",
             "--no-preview",
         ]
-    commands["ego"] = [
-        sys.executable,
-        "-m",
-        "three_device_slam.devices.two_uq2.worker",
-        "--device",
-        config.ego.video_device,
-        "--xu-library",
-        config.ego.xu_library,
-        "--device-id",
-        "ego",
-        "--session",
-        session_text,
-        "--barrier-dir",
-        barrier_text,
-    ]
+    ego_type = getattr(config.ego, "type", "2uq2")
+    if ego_type == "d435i":
+        commands["ego"] = [
+            sys.executable,
+            "-m",
+            "three_device_slam.devices.d435i_ego.worker",
+            "--serial",
+            config.ego.serial,
+            "--device-id",
+            "ego",
+            "--session",
+            session_text,
+            "--barrier-dir",
+            barrier_text,
+            "--calibration-id",
+            config.ego.calibration_id,
+        ]
+    elif ego_type == "2uq2":
+        commands["ego"] = [
+            sys.executable,
+            "-m",
+            "three_device_slam.devices.two_uq2.worker",
+            "--device",
+            config.ego.video_device,
+            "--xu-library",
+            config.ego.xu_library,
+            "--device-id",
+            "ego",
+            "--session",
+            session_text,
+            "--barrier-dir",
+            barrier_text,
+        ]
+    else:
+        raise ValueError("unsupported ego type")
     if config.duration_s is not None:
         duration_arguments = ["--duration", str(config.duration_s)]
         for command in commands.values():
             command.extend(duration_arguments)
     return commands
+
+
+def _capture_devices(config) -> tuple[str, ...]:
+    """Devices present for this product configuration."""
+    devices = ["ego"]
+    devices.extend(
+        role for role in ("left", "right") if getattr(config, role, None) is not None
+    )
+    return tuple(devices)
+
+
+def _capture_topology(config) -> str:
+    return "single_umi" if len(_capture_devices(config)) == 2 else "dual_umi"
+
+
+def _build_rsusb_owner_command(config, session: Path) -> list[str]:
+    if getattr(config.ego, "type", "2uq2") != "d435i":
+        raise ValueError("RSUSB owner requires d435i Ego")
+    if config.duration_s is None:
+        raise ValueError("RSUSB owner requires a finite duration")
+    umi_configs = tuple(
+        (role, getattr(config, role, None))
+        for role in ("left", "right")
+        if getattr(config, role, None) is not None
+    )
+    if not umi_configs:
+        raise ValueError("RSUSB owner requires at least one UMI")
+    protocols = tuple(
+        getattr(umi, "imu_protocol", "auto") for _, umi in umi_configs
+    )
+    if "auto" in protocols:
+        raise ValueError("RSUSB owner requires explicit UMI protocols")
+    command = [
+        sys.executable,
+        "-m",
+        "three_device_slam.acquisition.rsusb_pair",
+        "--session",
+        str(session),
+        "--ego-serial",
+        config.ego.serial,
+        "--ego-calibration-id",
+        config.ego.calibration_id,
+        "--umi-device-id",
+        umi_configs[0][0],
+        "--umi-serial",
+        umi_configs[0][1].serial,
+        "--umi-port",
+        umi_configs[0][1].imu_path,
+        "--umi-calibration-id",
+        umi_configs[0][1].calibration_id,
+        "--umi-protocol",
+        getattr(umi_configs[0][1], "imu_protocol", "auto"),
+    ]
+    if len(umi_configs) == 2:
+        command.extend(
+            [
+                "--right-serial",
+                config.right.serial,
+                "--right-port",
+                config.right.imu_path,
+                "--right-calibration-id",
+                config.right.calibration_id,
+                "--right-protocol",
+                getattr(config.right, "imu_protocol", "auto"),
+            ]
+        )
+    command.extend(["--duration", str(config.duration_s)])
+    return command
+
+
+def _run_rsusb_owner_capture(config, session: Path, stop_requested) -> dict:
+    """Run D435i and one or both D405 units under one RealSense lifecycle owner."""
+    from three_device_slam.acquisition import rsusb_pair
+
+    devices = _capture_devices(config)
+    command = _build_rsusb_owner_command(config, session)
+    args = rsusb_pair.parse_args(command[3:])
+    expected = {"ego": config.ego.calibration_id}
+    expected.update(
+        {
+            role: getattr(config, role).calibration_id
+            for role in ("left", "right")
+            if getattr(config, role, None) is not None
+        }
+    )
+    try:
+        group = rsusb_pair.run_pair(args, stop_requested=stop_requested)
+    except (rsusb_pair.RequiredHardwareUnavailable, rsusb_pair.CaptureCancelled) as exc:
+        report = _single_owner_terminal_report(
+            session,
+            command,
+            status="BLOCKED",
+            reason=(
+                "operator_cancelled"
+                if isinstance(exc, rsusb_pair.CaptureCancelled)
+                else "required_hardware_unavailable"
+            ),
+            expected_calibration_ids=expected,
+            devices=devices,
+            topology=_capture_topology(config),
+        )
+        _write_atomic_json(session / "coordinator.json", report)
+        return report
+    acceptances, acceptance_errors = _load_acceptances(session)
+    report = _single_owner_coordinator_report(
+        session,
+        command,
+        group,
+        acceptances,
+        acceptance_errors,
+        expected,
+        devices=devices,
+        topology=_capture_topology(config),
+    )
+    _write_atomic_json(session / "coordinator.json", report)
+    return report
+
+
+def _single_owner_terminal_report(
+    session: Path,
+    command: list[str],
+    *,
+    status: str,
+    reason: str,
+    expected_calibration_ids: Mapping[str, str],
+    devices: tuple[str, ...] = REQUIRED_DEVICES,
+    topology: str = "dual_umi",
+) -> dict:
+    session.mkdir(parents=True, exist_ok=True)
+    now_ns = time.monotonic_ns()
+    error = {"reason": reason, "at_ns": now_ns}
+    return {
+        "schema": SCHEMA,
+        "status": status,
+        "reason": reason,
+        "owner_model": "single_process_single_thread_realsense_lifecycle",
+        "capture_topology": topology,
+        "owner_command": _sanitize_command(command),
+        "worker_commands": {
+            device: _sanitize_command(command) for device in devices
+        },
+        "workers": {
+            device: {
+                "exit_code": 3 if status == "BLOCKED" else 2,
+                "early_exit": False,
+                "observed_running_at_or_after_formal_end": False,
+            }
+            for device in devices
+        },
+        "scheduled_start_ns": None,
+        "task_start_ego_frame_ns": None,
+        "transitions": [{"state": "COLD", "at_ns": now_ns}],
+        "host": {
+            "hostname": platform.node(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "git": _git_provenance(),
+        "calibration_evidence_ids": _calibration_evidence_ids({}, devices),
+        "calibration_expectations": {
+            device: {
+                "expected": calibration_id,
+                "observed": None,
+                "status": "BLOCKED",
+                "reason": "evidence_unavailable",
+            }
+            for device, calibration_id in expected_calibration_ids.items()
+        },
+        "worker_acceptance": {},
+        "barrier_failures": {},
+        "coordinator_errors": [],
+        "first_error": error,
+    }
+
+
+def _single_owner_coordinator_report(
+    session: Path,
+    command: list[str],
+    group: dict,
+    acceptances: dict,
+    acceptance_errors: list,
+    expected_calibration_ids: Mapping[str, str],
+    devices: tuple[str, ...] = REQUIRED_DEVICES,
+    topology: str = "dual_umi",
+) -> dict:
+    start_ns = group.get("formal_start_ns")
+    end_ns = group.get("formal_end_ns")
+    warmup_started_ns = group.get("warmup_started_ns")
+    joint_ready_ns = group.get("joint_ready_ns")
+    statuses = {
+        device: _validated_acceptance_status(device, acceptances.get(device))
+        for device in devices
+    }
+    complete = (
+        group.get("status") == "PASS"
+        and set(acceptances) == set(devices)
+        and all(status == "PASS" for status in statuses.values())
+        and not acceptance_errors
+        and isinstance(start_ns, int)
+        and isinstance(end_ns, int)
+        and end_ns > start_ns
+        and isinstance(warmup_started_ns, int)
+        and isinstance(joint_ready_ns, int)
+        and warmup_started_ns <= joint_ready_ns < start_ns
+    )
+    status = "PASS" if complete else "FAIL"
+    reason = "acquisition_timing" if complete else "single_owner_acceptance"
+    first_error = None if complete else {"reason": reason, "at_ns": time.monotonic_ns()}
+    task_start_ns = _task_start_ego_frame_ns(acceptances.get("ego"), start_ns)
+    transitions = []
+    if isinstance(warmup_started_ns, int):
+        transitions.append({"state": "COLD", "at_ns": warmup_started_ns})
+    if isinstance(joint_ready_ns, int):
+        transitions.append({"state": "JOINT_READY", "at_ns": joint_ready_ns})
+    if isinstance(start_ns, int):
+        transitions.append({"state": "RECORDING", "at_ns": start_ns})
+    if isinstance(end_ns, int):
+        transitions.append({"state": "COMPLETE", "at_ns": end_ns})
+    report = {
+        "schema": SCHEMA,
+        "status": status,
+        "reason": reason,
+        "owner_model": "single_process_single_thread_realsense_lifecycle",
+        "capture_topology": topology,
+        "owner_command": _sanitize_command(command),
+        "owner_acceptance": group,
+        "worker_commands": {
+            device: _sanitize_command(command) for device in devices
+        },
+        "workers": {
+            device: {
+                "exit_code": 0 if statuses[device] == "PASS" else 2,
+                "early_exit": False,
+                "observed_running_at_or_after_formal_end": isinstance(end_ns, int),
+            }
+            for device in devices
+        },
+        "scheduled_start_ns": start_ns,
+        "task_start_ego_frame_ns": task_start_ns,
+        "transitions": transitions,
+        "host": {
+            "hostname": platform.node(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        },
+        "git": _git_provenance(),
+        "calibration_evidence_ids": _calibration_evidence_ids(acceptances, devices),
+        "worker_acceptance": acceptances,
+        "barrier_failures": {},
+        "coordinator_errors": acceptance_errors,
+        "first_error": first_error,
+    }
+    report["calibration_expectations"] = _calibration_expectations(
+        expected_calibration_ids, acceptances, devices
+    )
+    return report
 
 
 @dataclass(frozen=True)
@@ -1247,18 +1533,22 @@ class CaptureResult:
 
 def run_product_capture(config, stop_requested) -> CaptureResult:
     session = _new_session(Path(config.output_root))
+    if getattr(config.ego, "type", "2uq2") == "d435i":
+        report = _run_rsusb_owner_capture(config, session, stop_requested)
+        return CaptureResult(session=session, report=report)
     commands = _build_worker_commands(config, session)
+    expected_calibration_ids = {
+        "ego": config.ego.calibration_id,
+        "left": config.left.calibration_id,
+        "right": config.right.calibration_id,
+    }
     report = run_coordinator(
         session,
         commands,
         config.duration_s,
         auto_start=True,
         stop_requested=stop_requested,
-        expected_calibration_ids={
-            "ego": config.ego.calibration_id,
-            "left": config.left.calibration_id,
-            "right": config.right.calibration_id,
-        },
+        expected_calibration_ids=expected_calibration_ids,
     )
     return CaptureResult(session=session, report=report)
 

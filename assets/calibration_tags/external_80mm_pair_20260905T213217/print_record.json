@@ -1,0 +1,33 @@
+{
+  "schema": "three-device-slam.print-record.v1",
+  "verified_timestamp_local": "2026-09-05T21:33:44+08:00",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "cups_job_id": "Brother_DCP_B7530DN_series_USB-11",
+  "copies_per_file": 1,
+  "file_count": 2,
+  "files": {
+    "left_id1/external_tag36h11_id1_80mm_a4.pdf": "7f75a161f022e55141f05011876753739497ded49ada8f60dea2b9b038963871",
+    "right_id2/external_tag36h11_id2_80mm_a4.pdf": "96e549604bfbcc681265a5fe19a361452756ae73270752f716e1198eaa977112"
+  },
+  "options": {"PageSize": "A4", "print-scaling": "none", "Duplex": "None", "cupsPrintQuality": "High"},
+  "cups_status": "completed",
+  "physical_output_status": "OPERATOR_REPORTS_ONLY_ONE_SHEET",
+  "physical_sheets_received": 1,
+  "received_tag_id": 2,
+  "supplemental_job_id": "Brother_DCP_B7530DN_series_USB-12",
+  "supplemental_file": "left_id1/external_tag36h11_id1_80mm_a4.pdf",
+  "supplemental_copies": 1,
+  "supplemental_status": "cups_completed_printer_idle",
+  "supplemental_verified_at": "2026-09-05T21:46:34+08:00",
+  "supplemental_physical_receipt": "OPERATOR_READY_AND_LIVE_PREVIEW_SHOWS_BOTH_EXTERNAL_IDS_1_2",
+  "cups_filter_warning": "Job11: file is damaged; xref not found; Attempting to reconstruct cross-reference table",
+  "warning_interpretation": "Both source PDFs validate individually; multi-document print path warned. Exact missing ID and cause not yet established; do not treat scheduler completed as two physical sheets verified.",
+  "printer_status_after_job": "idle",
+  "digital_pdf_decode": [1, 2],
+  "pdf_raster_detected_edge_mm": 79.925,
+  "nominal_black_square_mm": 80,
+  "white_margin_mm": 10,
+  "physical_measurement": "PENDING",
+  "placement": "Left external ID1 and right external ID2 replace old small external tags; preserve UMI-back mount ID1 at40mm",
+  "next_step": "Mixed external80mm/mount40mm solver and preview configuration must be implemented before capture acceptance"
+}

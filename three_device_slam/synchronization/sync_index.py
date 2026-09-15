@@ -2,6 +2,7 @@
 
 from bisect import bisect_left
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from three_device_slam.core.model import FrameStamp, Triplet
 
@@ -9,6 +10,64 @@ from three_device_slam.core.model import FrameStamp, Triplet
 GRID_NS = 33_333_333
 TARGET_SPAN_NS = 10_000_000
 HARD_SPAN_NS = 16_700_000
+
+
+@dataclass(frozen=True)
+class PairRow:
+    sample_ns: int
+    ego: FrameStamp
+    left: FrameStamp
+    span_ns: int
+    trainable: bool
+    reason: str
+
+
+def build_pairs(
+    ego: Sequence[FrameStamp],
+    left: Sequence[FrameStamp],
+    umi_device_id: str = "left",
+) -> list[PairRow]:
+    """Match Ego and one UMI frame stream on the frozen 30 Hz common grid."""
+    if umi_device_id not in {"left", "right"}:
+        raise ValueError("umi_device_id must be left or right")
+    streams = (
+        _validate_stream(ego, "ego"),
+        _validate_stream(left, umi_device_id),
+    )
+    if any(not stream for stream in streams):
+        return []
+
+    overlap_start = max(stream[0].acquisition_ns for stream in streams)
+    overlap_end = min(stream[-1].acquisition_ns for stream in streams)
+    if overlap_start > overlap_end:
+        return []
+
+    timestamp_streams = [
+        [frame.acquisition_ns for frame in stream] for stream in streams
+    ]
+    pairs = []
+    grid_ns = overlap_start
+    while grid_ns <= overlap_end:
+        selected = tuple(
+            _nearest_frame(stream, timestamps, grid_ns)
+            for stream, timestamps in zip(streams, timestamp_streams)
+        )
+        timestamps = sorted(frame.acquisition_ns for frame in selected)
+        sample_ns = (timestamps[0] + timestamps[-1]) // 2
+        span_ns = timestamps[-1] - timestamps[0]
+        trainable, reason = _classify(span_ns)
+        pairs.append(
+            PairRow(
+                sample_ns=sample_ns,
+                ego=selected[0],
+                left=selected[1],
+                span_ns=span_ns,
+                trainable=trainable,
+                reason=reason,
+            )
+        )
+        grid_ns += GRID_NS
+    return pairs
 
 
 def build_triplets(

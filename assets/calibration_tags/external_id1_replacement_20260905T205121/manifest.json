@@ -1,0 +1,16 @@
+{
+  "family": "tag36h11",
+  "id": 1,
+  "black_square_mm": 40,
+  "white_margin_mm": 10,
+  "opencv_version": "4.10.0",
+  "pattern_source": "OpenCV DICT_APRILTAG_36H11.generateImageMarker",
+  "digital_decode": [
+    1
+  ],
+  "physical_measurement": "PENDING",
+  "files": {
+    "external_tag36h11_id1_40mm.png": "3a98d304280498f2076a07922d50569166e0ce0517fc505ff844992442a8bc08",
+    "external_tag36h11_id1_40mm_a4.pdf": "0efdd415417867c42cd1c860a42ab7a48cbe91f8a0a92a07e60fe4fa82dfba16"
+  }
+}

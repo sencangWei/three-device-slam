@@ -1,0 +1,28 @@
+{
+  "schema": "three-device-slam.print-record.v1",
+  "submitted_timestamp_local": "2026-09-13T16:29:45+08:00",
+  "completed_timestamp_local": "2026-09-13T16:30:07+08:00",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "cups_job_id": "Brother_DCP_B7530DN_series_USB-16",
+  "copies": 1,
+  "source_pdf": "umi_device3_right_tag36h11_id1_40mm_a4.pdf",
+  "source_pdf_sha256": "79eb0a1619744008a1b7814333af5cde8aee52cf8159478d75247b8ae3c58788",
+  "options": {
+    "PageSize": "A4",
+    "print-scaling": "none",
+    "Duplex": "None",
+    "cupsPrintQuality": "High"
+  },
+  "cups_status": "completed",
+  "printer_status_after_job": "idle",
+  "digital_pdf_decode": 1,
+  "pdf_raster_detected_edge_mm": 39.878,
+  "nominal_black_square_mm": 40.0,
+  "full_grid_with_quiet_zone_mm": 50.0,
+  "physical_measurement": "PENDING",
+  "required_measurements": {
+    "black_square_mm": 40.0,
+    "verification_ruler_mm": 100.0
+  },
+  "mounting": "flat rigid light backing with at least 10 mm visible white margin"
+}

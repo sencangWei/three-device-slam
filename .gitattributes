@@ -1,1 +1,9 @@
 *.sh text eol=lf
+*.pdf binary
+*.png binary
+*.pgm binary
+patches/*.patch whitespace=-trailing-space,-blank-at-eof
+docker/covins_g_runtime/*.patch whitespace=-trailing-space,-blank-at-eof
+docker/covins_g_diagnostic/** whitespace=-trailing-space,-space-before-tab
+docs/acceptance/docker2-stationary-loop-probe-20260904.md whitespace=-trailing-space
+docs/acceptance/rk3576-umi-zstd-h265-70s-20260904.md whitespace=-trailing-space,-blank-at-eof

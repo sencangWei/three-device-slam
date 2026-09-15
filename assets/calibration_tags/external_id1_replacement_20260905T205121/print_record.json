@@ -1,0 +1,18 @@
+{
+  "schema": "three-device-slam.print-record.v1",
+  "verified_timestamp_local": "2026-09-05T20:52:26+08:00",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "cups_job_id": "Brother_DCP_B7530DN_series_USB-10",
+  "copies": 1,
+  "source_pdf": "external_tag36h11_id1_40mm_a4.pdf",
+  "source_pdf_sha256": "0efdd415417867c42cd1c860a42ab7a48cbe91f8a0a92a07e60fe4fa82dfba16",
+  "options": {"PageSize": "A4", "print-scaling": "none", "Duplex": "None", "cupsPrintQuality": "High"},
+  "cups_status": "completed",
+  "printer_status_after_job": "idle",
+  "digital_pdf_decode": 1,
+  "pdf_raster_detected_edge_mm": 39.878,
+  "nominal_black_square_mm": 40,
+  "white_margin_mm": 10,
+  "physical_measurement": "PENDING",
+  "placement": "Replace wrinkled LEFT external ID1 on rigid flat backing. Keep RIGHT external ID2 and UMI-back mount ID1 unchanged."
+}

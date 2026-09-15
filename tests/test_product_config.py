@@ -41,12 +41,122 @@ def test_loads_frozen_distinct_device_config(tmp_path):
 
     assert config.left.serial == "left-serial"
     assert config.left.imu_path == "/dev/serial/by-id/left-imu"
+    assert config.left.imu_protocol == "auto"
     assert config.right.serial == "right-serial"
+    assert config.ego.type == "2uq2"
     assert config.ego.video_device == "/dev/video0"
     assert config.output_root == Path("/var/lib/three-device-slam/sessions")
     assert config.duration_s is None
     with pytest.raises(FrozenInstanceError):
         config.left.serial = "replacement"
+
+
+def test_loads_explicit_d405_imu_protocol(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload["left"]["imu_protocol"] = "stm32_combined_v1"
+    payload["right"]["imu_protocol"] = "kt_ex9_37"
+
+    config = load_product_config(write_payload(tmp_path, payload))
+
+    assert config.left.imu_protocol == "stm32_combined_v1"
+    assert config.right.imu_protocol == "kt_ex9_37"
+
+
+def test_rejects_unknown_d405_imu_protocol(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload["left"]["imu_protocol"] = "invented"
+
+    with pytest.raises(ConfigError, match="imu_protocol"):
+        load_product_config(write_payload(tmp_path, payload))
+
+
+def test_loads_explicit_d435i_ego_config(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload["ego"] = {
+        "type": "d435i",
+        "serial": "327122078613",
+        "calibration_id": "d435i-factory-327122078613-v1",
+    }
+
+    config = load_product_config(write_payload(tmp_path, payload))
+
+    assert config.ego.type == "d435i"
+    assert config.ego.serial == "327122078613"
+    assert config.ego.video_device is None
+    assert config.ego.xu_library is None
+
+
+def d435i_single_umi_payload(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload.pop("right")
+    payload["ego"] = {
+        "type": "d435i",
+        "serial": "327122078613",
+        "calibration_id": "d435i-factory-327122078613-v1",
+    }
+    payload["left"]["imu_protocol"] = "stm32_combined_v1"
+    return payload
+
+
+def test_loads_d435i_single_umi_config_without_right(tmp_path):
+    config = load_product_config(
+        write_payload(tmp_path, d435i_single_umi_payload(tmp_path))
+    )
+
+    assert config.ego.type == "d435i"
+    assert config.right is None
+    assert config.left.imu_protocol == "stm32_combined_v1"
+
+
+def test_loads_d435i_single_umi_config_with_null_right(tmp_path):
+    payload = d435i_single_umi_payload(tmp_path)
+    payload["right"] = None
+
+    config = load_product_config(write_payload(tmp_path, payload))
+
+    assert config.right is None
+
+
+def test_loads_d435i_right_only_config(tmp_path):
+    payload = d435i_single_umi_payload(tmp_path)
+    payload["right"] = payload.pop("left")
+
+    config = load_product_config(write_payload(tmp_path, payload))
+
+    assert config.left is None
+    assert config.right.serial == "left-serial"
+
+
+def test_rejects_d435i_without_any_umi(tmp_path):
+    payload = d435i_single_umi_payload(tmp_path)
+    payload.pop("left")
+
+    with pytest.raises(ConfigError, match="at least one UMI"):
+        load_product_config(write_payload(tmp_path, payload))
+
+
+def test_rejects_missing_right_for_2uq2_ego(tmp_path):
+    payload = valid_payload(tmp_path)
+    payload.pop("right")
+
+    with pytest.raises(ConfigError, match="right UMI is required"):
+        load_product_config(write_payload(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    "ego",
+    [
+        {"type": "d435i", "calibration_id": "cal"},
+        {"type": "d435i", "serial": "serial", "calibration_id": "cal", "extra": 1},
+        {"type": "other", "serial": "serial", "calibration_id": "cal"},
+    ],
+)
+def test_rejects_invalid_explicit_ego_type_config(tmp_path, ego):
+    payload = valid_payload(tmp_path)
+    payload["ego"] = ego
+
+    with pytest.raises(ConfigError):
+        load_product_config(write_payload(tmp_path, payload))
 
 
 def test_rejects_duplicate_d405_identity(tmp_path):

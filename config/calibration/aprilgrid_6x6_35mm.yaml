@@ -1,0 +1,8 @@
+# Physical AprilGrid used by the D405 calibration workflow.
+# Measure the printed black tag square before each calibration and update
+# tagSize if it differs from 35.2 mm.
+target_type: aprilgrid
+tagCols: 6
+tagRows: 6
+tagSize: 0.0352
+tagSpacing: 0.3

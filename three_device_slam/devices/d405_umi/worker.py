@@ -152,6 +152,17 @@ def capture_streams_for_mode(mode: str) -> tuple:
     raise ValueError(f"unsupported capture mode: {mode}")
 
 
+def drain_frame_queue(frame_queue, limit: int = MONITOR_QUEUE_CAPACITY) -> tuple:
+    """Consume one bounded batch before joint-mode barrier I/O."""
+    frames = []
+    for _ in range(limit):
+        frame = frame_queue.poll_for_frame()
+        if not frame:
+            break
+        frames.append(frame)
+    return tuple(frames)
+
+
 @dataclass
 class StreamContinuity:
     received: int = 0
@@ -806,6 +817,23 @@ def persisted_imu_covers_formal(
     )
 
 
+def count_persisted_imu_samples(path: Path, *, start_ns: int, stop_ns: int) -> int:
+    """Count finalized IMU rows inside the joint host-monotonic window."""
+    count = 0
+    with Path(path).open(newline="", encoding="utf-8") as file_handle:
+        for row in csv.DictReader(file_handle):
+            try:
+                timestamp_s = float(row["ts_mono"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid persisted IMU ts_mono") from exc
+            if not math.isfinite(timestamp_s):
+                raise ValueError("invalid persisted IMU ts_mono")
+            timestamp_ns = int(round(timestamp_s * 1_000_000_000))
+            if start_ns <= timestamp_ns <= stop_ns:
+                count += 1
+    return count
+
+
 def stats_delta(start: dict, end: dict) -> dict:
     return {key: end.get(key, 0) - value for key, value in start.items()}
 
@@ -1102,6 +1130,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serial", required=True)
     parser.add_argument("--imu-port", required=True)
     parser.add_argument("--imu-baud", type=int, default=921600)
+    parser.add_argument(
+        "--imu-protocol",
+        choices=("auto", "kt_ex9_37", "stm32_combined_v1"),
+        default="auto",
+    )
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument(
         "--capture-mode",
@@ -1322,16 +1355,20 @@ def preview_mosaic(frame_map: dict) -> np.ndarray:
 
 def _main() -> int:
     args = parse_args()
+    return run(args)
+
+
+def run(args, *, realsense_context=None) -> int:
     claim = (
         producer_claim(args.session, args.device_id)
         if args.session is not None
         else nullcontext()
     )
     with claim:
-        return _run_claimed(args)
+        return _run_claimed(args, realsense_context=realsense_context)
 
 
-def _run_claimed(args) -> int:
+def _run_claimed(args, *, realsense_context=None) -> int:
     global STREAMS, STREAM_KEYS, CAMERA_RAW_BYTES_PER_SECOND
     _load_hardware_modules()
     STREAMS = capture_streams_for_mode(args.capture_mode)
@@ -1486,13 +1523,16 @@ def _run_claimed(args) -> int:
         args.imu_port,
         baud=args.imu_baud,
         warmup_frames=imu_reader_warmup_frames(joint_mode),
+        protocol=args.imu_protocol,
         on_sample=record_imu,
         on_raw_packet=imu_recorder.put_raw_imu_packet,
         name="all_streams_imu",
     )
 
     context = run_prestart_step(
-        joint_controller, "camera_disconnect", rs.context
+        joint_controller,
+        "camera_disconnect",
+        lambda: realsense_context if realsense_context is not None else rs.context(),
     )
     base_device = run_prestart_step(
         joint_controller,
@@ -1656,13 +1696,12 @@ def _run_claimed(args) -> int:
         if joint_mode:
             warmup_complete = False
             while True:
-                frame = run_prestart_step(
+                frames = run_prestart_step(
                     joint_controller,
                     "camera_disconnect",
-                    frame_queue.poll_for_frame,
+                    lambda: drain_frame_queue(frame_queue),
                 )
-                now_ns = time.monotonic_ns()
-                if frame:
+                for frame in frames:
                     key = stream_key(frame)
                     if key is not None:
                         camera_clock_evidence.observe(
@@ -1674,10 +1713,11 @@ def _run_claimed(args) -> int:
                         joint_health.observe_camera(
                             key,
                             device_ms,
-                            now_ns,
+                            time.monotonic_ns(),
                             frame_number=int(frame.get_frame_number()),
                         )
                         joint_controller.observe_camera(key, device_ms)
+                now_ns = time.monotonic_ns()
                 camera_ready = all(
                     count >= max(0, args.warmup_frames)
                     for count in warmup_counts.values()
@@ -1725,7 +1765,7 @@ def _run_claimed(args) -> int:
                     joint_controller.mark_camera_backlog_drained()
                     prestart_failure_reason = None
                     break
-                if not frame:
+                if not frames:
                     time.sleep(0.005)
         while not joint_mode:
             frame = frame_queue.wait_for_frame(timeout_ms=2000)
@@ -1784,7 +1824,22 @@ def _run_claimed(args) -> int:
         stop_requested = False
         while True:
             if joint_mode:
-                frame = frame_queue.poll_for_frame()
+                frames = drain_frame_queue(frame_queue)
+                for frame in frames:
+                    key = stream_key(frame)
+                    if key is None:
+                        continue
+                    camera_clock_evidence.observe(
+                        key, frame.get_frame_timestamp_domain()
+                    )
+                    device_ms = float(frame.get_timestamp())
+                    joint_health.observe_camera(
+                        key,
+                        device_ms,
+                        time.monotonic_ns(),
+                        frame_number=int(frame.get_frame_number()),
+                    )
+                    joint_controller.observe_camera(key, device_ms)
                 now_ns = time.monotonic_ns()
                 healthy, reasons, terminal_reason = current_joint_health(now_ns, True)
                 if poll_joint_formal_window(
@@ -1797,83 +1852,82 @@ def _run_claimed(args) -> int:
                     duration_s=args.duration,
                 ):
                     break
-                if not frame:
+                if not frames:
                     time.sleep(0.005)
                     continue
             else:
-                frame = frame_queue.wait_for_frame(timeout_ms=2000)
-            now_mono = time.monotonic()
-            if (
-                args.duration is not None
-                and now_mono - formal_start_mono >= args.duration
-            ):
-                break
-            key = stream_key(frame)
-            if key is None:
-                continue
-            if camera_clock_evidence is not None:
-                camera_clock_evidence.observe(
-                    key, frame.get_frame_timestamp_domain()
-                )
-            number = int(frame.get_frame_number())
-            if number <= warmup_cutoff[key]:
-                continue
-            device_ms = float(frame.get_timestamp())
-            if joint_mode:
-                now_ns = time.monotonic_ns()
-                joint_health.observe_camera(
-                    key, device_ms, now_ns, frame_number=number
-                )
-                joint_controller.observe_camera(key, device_ms)
-            stream_stats[key].add(number, device_ms)
-            latest_frames[key] = frame
+                frames = (frame_queue.wait_for_frame(timeout_ms=2000),)
+            for frame in frames:
+                now_mono = time.monotonic()
+                if (
+                    not joint_mode
+                    and args.duration is not None
+                    and now_mono - formal_start_mono >= args.duration
+                ):
+                    stop_requested = True
+                    break
+                key = stream_key(frame)
+                if key is None:
+                    continue
+                if camera_clock_evidence is not None and not joint_mode:
+                    camera_clock_evidence.observe(
+                        key, frame.get_frame_timestamp_domain()
+                    )
+                number = int(frame.get_frame_number())
+                if number <= warmup_cutoff[key]:
+                    continue
+                device_ms = float(frame.get_timestamp())
+                stream_stats[key].add(number, device_ms)
+                latest_frames[key] = frame
 
-            if len(latest_frames) == len(STREAM_KEYS):
-                timestamps_ms = [
-                    float(latest_frames[name].get_timestamp())
-                    for name in STREAM_KEYS
-                ]
-                signature = tuple(
-                    int(latest_frames[name].get_frame_number())
-                    for name in STREAM_KEYS
-                )
-                aligned = timestamps_aligned(timestamps_ms, SYNC_TOLERANCE_MS)
-            else:
-                signature = None
-                aligned = False
+                if len(latest_frames) == len(STREAM_KEYS):
+                    timestamps_ms = [
+                        float(latest_frames[name].get_timestamp())
+                        for name in STREAM_KEYS
+                    ]
+                    signature = tuple(
+                        int(latest_frames[name].get_frame_number())
+                        for name in STREAM_KEYS
+                    )
+                    aligned = timestamps_aligned(timestamps_ms, SYNC_TOLERANCE_MS)
+                else:
+                    signature = None
+                    aligned = False
 
-            if aligned and signature != last_complete_signature:
-                complete_sets += 1
-                if vins_bridge is not None:
-                    left_frame = latest_frames["infrared_left"]
-                    right_frame = latest_frames["infrared_right"]
-                    left_image = np.asanyarray(left_frame.get_data())
-                    right_image = np.asanyarray(right_frame.get_data())
-                    vins_bridge.feed_camera(
-                        CameraFrame(
-                            ts=live_vins_timestamp_monotonic(
-                                float(left_frame.get_timestamp()), epoch_offset
-                            ),
-                            color=left_image,
-                            depth=None,
-                            frame_idx=complete_sets,
-                            ts_arrival=now_mono,
-                            ts_domain="global_time",
-                            frame_number=int(left_frame.get_frame_number()),
-                            infrared_left=left_image,
-                            infrared_right=right_image,
+                if aligned and signature != last_complete_signature:
+                    complete_sets += 1
+                    if vins_bridge is not None:
+                        left_frame = latest_frames["infrared_left"]
+                        right_frame = latest_frames["infrared_right"]
+                        left_image = np.asanyarray(left_frame.get_data())
+                        right_image = np.asanyarray(right_frame.get_data())
+                        vins_bridge.feed_camera(
+                            CameraFrame(
+                                ts=live_vins_timestamp_monotonic(
+                                    float(left_frame.get_timestamp()), epoch_offset
+                                ),
+                                color=left_image,
+                                depth=None,
+                                frame_idx=complete_sets,
+                                ts_arrival=now_mono,
+                                ts_domain="global_time",
+                                frame_number=int(left_frame.get_frame_number()),
+                                infrared_left=left_image,
+                                infrared_right=right_image,
+                            )
                         )
-                    )
-                    live_vins_frames_forwarded += 1
-                if not args.no_preview and now_mono >= next_preview_mono:
-                    cv2.imshow(
-                        f"D405 720p: {args.capture_mode} | IR Left | IR Right",
-                        preview_mosaic(latest_frames),
-                    )
-                    next_preview_mono = now_mono + 0.1
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        stop_requested = True
-                last_complete_signature = signature
+                        live_vins_frames_forwarded += 1
+                    if not args.no_preview and now_mono >= next_preview_mono:
+                        cv2.imshow(
+                            f"D405 720p: {args.capture_mode} | IR Left | IR Right",
+                            preview_mosaic(latest_frames),
+                        )
+                        next_preview_mono = now_mono + 0.1
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            stop_requested = True
+                    last_complete_signature = signature
+                if stop_requested:
+                    break
             if stop_requested:
                 break
         formal_stop_mono = time.monotonic()
@@ -2048,6 +2102,22 @@ def _run_claimed(args) -> int:
         else (0 if imu_recorder_clean_shutdown else None)
     )
     formal_imu_samples = int(imu_formal.get("frames_ok", 0))
+    persisted_formal_window_error = None
+    if joint_mode:
+        if formal_start_host_ns is None or formal_stop_mono is None:
+            formal_imu_samples = 0
+            persisted_formal_window_error = "formal window unavailable"
+        else:
+            try:
+                formal_imu_samples = count_persisted_imu_samples(
+                    session / "external_imu" / "imu_ts.csv",
+                    start_ns=formal_start_host_ns,
+                    stop_ns=int(formal_stop_mono * 1_000_000_000),
+                )
+            except (OSError, ValueError) as exc:
+                formal_imu_samples = 0
+                persisted_formal_window_error = f"{type(exc).__name__}: {exc}"
+        imu_formal["frames_ok"] = formal_imu_samples
     persisted_formal_lower_bound_ok = persisted_imu_covers_formal(
         clean_shutdown=imu_recorder_clean_shutdown,
         persisted_samples=imu_samples_written,
@@ -2119,6 +2189,7 @@ def _run_claimed(args) -> int:
             )
         )
         and bool(imu_formal)
+        and persisted_formal_window_error is None
         and imu_transport_accepted(
             imu_protocol, imu_rate_hz, imu_formal, imu_recorder.dropped
         )
@@ -2178,6 +2249,7 @@ def _run_claimed(args) -> int:
         "camera_serial": args.serial,
         "camera_firmware": firmware,
         "usb_type": usb_type,
+        "imu_protocol_requested": args.imu_protocol,
         "warmup_frames": max(0, args.warmup_frames),
         "imu_warmup_frames": IMU_WARMUP_FRAMES,
         "warmup_recorded": joint_mode,
@@ -2220,6 +2292,12 @@ def _run_claimed(args) -> int:
             "recorder_clean_shutdown": imu_recorder_clean_shutdown,
             "rate_hz": imu_rate_hz,
             "recorder_drops": imu_recorder.dropped,
+            "formal_sample_source": (
+                "persisted_imu_ts_monotonic_window"
+                if joint_mode
+                else "persisted_formal_only_imu_bin"
+            ),
+            "persisted_formal_window_error": persisted_formal_window_error,
         },
         "gripper_encoder": {
             "required_for_training": imu_protocol == "stm32_combined_v1",

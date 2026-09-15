@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import struct
 import threading
 import time
@@ -18,6 +19,9 @@ class DeviceUnavailableError(RuntimeError):
 
 class CaptureRuntimeError(RuntimeError):
     pass
+
+
+STANDARD_GRAVITY_M_S2 = 9.80665
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,22 @@ class TwoUQ2Packet:
             backup_gyro_dps=tuple(value / 16.4 for value in backup[3:]),
             raw=raw_bytes,
         )
+
+    @property
+    def main_raw(self) -> bytes:
+        return self.raw[3:15]
+
+    @property
+    def backup_raw(self) -> bytes:
+        return self.raw[15:27]
+
+    @property
+    def main_accel_m_s2(self) -> tuple[float, float, float]:
+        return tuple(value * STANDARD_GRAVITY_M_S2 for value in self.main_accel_g)
+
+    @property
+    def main_gyro_rad_s(self) -> tuple[float, float, float]:
+        return tuple(math.radians(value) for value in self.main_gyro_dps)
 
 
 @dataclass(frozen=True)

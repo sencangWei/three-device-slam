@@ -10,6 +10,7 @@ from pathlib import Path
 
 from three_device_slam.acquisition import coordinator
 from three_device_slam.config import ConfigError, load_product_config
+from three_device_slam.quality import verify_pair_session as pair_verifier
 from three_device_slam.quality import verify_session as session_verifier
 from three_device_slam.synchronization import build_index as index_builder
 
@@ -20,6 +21,7 @@ EXIT_CODES = {"PASS": 0, "FAIL": 2, "BLOCKED": 3}
 run_capture = coordinator.run_product_capture
 build_index = index_builder.build_index
 verify_session = session_verifier.verify_session
+verify_pair_session = pair_verifier.verify_pair_session
 
 
 def parse_args(argv=None):
@@ -94,8 +96,13 @@ def _run_product(config, stop_event: threading.Event) -> int:
         return EXIT_CODES["FAIL"]
     print("index=PASS")
 
+    single_umi = capture_result.report.get("capture_topology") == "single_umi"
     try:
-        verification_report = verify_session(session)
+        verification_report = (
+            verify_pair_session(session)
+            if single_umi
+            else verify_session(session)
+        )
         verification_status = _status(verification_report, "verification")
         overall = session_verifier.compose_product_status(verification_status)[
             "overall"
@@ -117,15 +124,14 @@ def _status(report, stage: str) -> str:
 
 def _calibration_status(report) -> str:
     expectations = report.get("calibration_expectations")
-    if not isinstance(expectations, dict) or set(expectations) != {
-        "ego",
-        "left",
-        "right",
-    }:
+    if not isinstance(expectations, dict) or set(expectations) not in (
+        {"ego", "left"},
+        {"ego", "right"},
+        {"ego", "left", "right"},
+    ):
         return "BLOCKED"
     statuses = []
-    for device in ("ego", "left", "right"):
-        item = expectations[device]
+    for item in expectations.values():
         if not isinstance(item, dict) or item.get("status") not in EXIT_CODES:
             return "FAIL"
         statuses.append(item["status"])

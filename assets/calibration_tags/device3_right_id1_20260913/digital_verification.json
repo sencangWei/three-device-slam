@@ -1,0 +1,8 @@
+{
+  "schema": "three-device-slam.apriltag-pdf-verification.v1",
+  "decoded_ids": [
+    1
+  ],
+  "render_dpi": 300,
+  "measured_black_edge_mm": 39.878
+}

@@ -31,11 +31,14 @@ from three_device_slam.synchronization.sync_index import (
     GRID_NS,
     HARD_SPAN_NS,
     TARGET_SPAN_NS,
+    build_pairs,
     build_triplets,
 )
 
 
 SCHEMA = "ego.three_device.sync_index.v1"
+PAIR_SCHEMA = "ego.two_device.sync_index.v1"
+PAIR_ROLE_SCHEMA = "ego.two_device.sync_index.v2"
 SEAL_SCHEMA = "three-device-slam.session-seal.v1"
 COORDINATOR_SCHEMA = "ego.three_device.coordinator.v1"
 SOURCE_PATHS = (
@@ -46,6 +49,22 @@ SOURCE_PATHS = (
     "right/acceptance.json",
     "right/d405_frames.csv",
 )
+PAIR_SOURCE_PATHS = (
+    "coordinator.json",
+    "ego/ego.ir_left.jsonl",
+    "left/acceptance.json",
+    "left/left.ir_left.jsonl",
+)
+PAIR_RIGHT_SOURCE_PATHS = (
+    "coordinator.json",
+    "ego/ego.ir_left.jsonl",
+    "right/acceptance.json",
+    "right/right.ir_left.jsonl",
+)
+D435I_EGO_STREAM_ID = "ego.ir_left"
+D435I_CLOCK_DOMAIN = "realsense_global_time_mapped_to_host_monotonic"
+TOPOLOGY_LEGACY = "legacy_three_device"
+TOPOLOGY_PAIR = "d435i_single_umi"
 CSV_HEADER = (
     "sample_ns",
     "ego_sequence",
@@ -61,7 +80,51 @@ CSV_HEADER = (
     "trainable",
     "reason",
 )
+PAIR_CSV_HEADER = (
+    "sample_ns",
+    "ego_sequence",
+    "ego_acquisition_ns",
+    "ego_ref",
+    "left_sequence",
+    "left_acquisition_ns",
+    "left_ref",
+    "span_ns",
+    "trainable",
+    "reason",
+)
+PAIR_ROLE_CSV_HEADER = (
+    "sample_ns",
+    "ego_sequence",
+    "ego_acquisition_ns",
+    "ego_ref",
+    "umi_role",
+    "umi_sequence",
+    "umi_acquisition_ns",
+    "umi_ref",
+    "span_ns",
+    "trainable",
+    "reason",
+)
 REASONS = ("within_target", "within_hard_limit", "span_over_hard_limit")
+
+
+def _detect_topology(session: Path) -> str:
+    if (session / "ego/ego.video.jsonl").is_file():
+        return TOPOLOGY_LEGACY
+    if (session / "ego/ego.ir_left.jsonl").is_file():
+        return TOPOLOGY_PAIR
+    raise ValueError(
+        "session topology is unrecognized: missing ego/ego.video.jsonl "
+        "and ego/ego.ir_left.jsonl"
+    )
+
+
+def _source_paths(topology: str) -> tuple[str, ...]:
+    if topology == TOPOLOGY_LEGACY:
+        return SOURCE_PATHS
+    if topology == TOPOLOGY_PAIR:
+        return PAIR_SOURCE_PATHS
+    raise ValueError(f"unsupported session topology: {topology}")
 
 
 def build_index(session: Path) -> dict:
@@ -112,10 +175,16 @@ def _build_index_locked(session: Path, seal: dict) -> dict:
 def _build_artifacts(
     source_bytes: dict[str, bytes], seal: dict, git: dict
 ) -> tuple[bytes, dict]:
+    topology = _seal_topology(seal)
     source_sha256 = {
-        relative: seal["sources"][relative]["sha256"] for relative in SOURCE_PATHS
+        relative: seal["sources"][relative]["sha256"]
+        for relative in seal["sources"]
     }
     task_start_ns = _parse_coordinator(source_bytes["coordinator.json"])
+    if topology == TOPOLOGY_PAIR:
+        return _build_pair_artifacts(
+            source_bytes, seal, git, source_sha256, task_start_ns
+        )
     ego = _parse_ego_rows(source_bytes["ego/ego.video.jsonl"], task_start_ns)
     _validate_d405_clock(
         source_bytes["left/acceptance.json"],
@@ -139,6 +208,7 @@ def _build_artifacts(
     reason_counts = Counter(row.reason for row in triplets)
     manifest = {
         "schema": SCHEMA,
+        "capture_topology": TOPOLOGY_LEGACY,
         "source_sha256": source_sha256,
         "grid_ns": GRID_NS,
         "target_span_ns": TARGET_SPAN_NS,
@@ -178,6 +248,77 @@ def _build_artifacts(
     return csv_bytes, manifest
 
 
+def _build_pair_artifacts(
+    source_bytes: dict[str, bytes],
+    seal: dict,
+    git: dict,
+    source_sha256: dict[str, str],
+    task_start_ns: int,
+) -> tuple[bytes, dict]:
+    coordinator = _load_json_object(
+        source_bytes["coordinator.json"], "coordinator.json"
+    )
+    umi_role = _pair_role_from_sources(source_bytes)
+    _validate_pair_worker_acceptances(coordinator, umi_role)
+    ego = _parse_d435i_ego_rows(
+        source_bytes["ego/ego.ir_left.jsonl"], task_start_ns
+    )
+    umi = _parse_pair_umi_rows(
+        source_bytes[f"{umi_role}/{umi_role}.ir_left.jsonl"], umi_role, task_start_ns
+    )
+    pairs = build_pairs(ego, umi, umi_role)
+    csv_bytes = _serialize_pair_csv(pairs, umi_role)
+    overlap = _pair_overlap(ego, umi)
+    reason_counts = Counter(row.reason for row in pairs)
+    manifest = {
+        "schema": PAIR_SCHEMA if umi_role == "left" else PAIR_ROLE_SCHEMA,
+        "capture_topology": TOPOLOGY_PAIR,
+        "source_sha256": source_sha256,
+        "grid_ns": GRID_NS,
+        "target_span_ns": TARGET_SPAN_NS,
+        "hard_span_ns": HARD_SPAN_NS,
+        "input_config": {
+            "ego": {
+                "source": "ego/ego.ir_left.jsonl",
+                "stream_id": D435I_EGO_STREAM_ID,
+                "clock_domain": D435I_CLOCK_DOMAIN,
+                "timestamp_field": "acquisition_ns",
+                "formal_filter": "warmup=false,valid=true",
+            },
+            umi_role: {
+                "source": f"{umi_role}/{umi_role}.ir_left.jsonl",
+                "stream_id": f"{umi_role}.ir_left",
+                "clock_domain": D435I_CLOCK_DOMAIN,
+                "timestamp_field": "acquisition_ns",
+                "formal_filter": "warmup=false,valid=true",
+            },
+        },
+        "common_overlap": overlap,
+        "row_count": len(pairs),
+        "trainable_count": sum(row.trainable for row in pairs),
+        "reason_counts": {reason: reason_counts[reason] for reason in REASONS},
+        "task_start_ego_frame_ns": task_start_ns,
+        "git": _validated_git_provenance(git),
+        "session_seal_sha256": seal["content_sha256"],
+        "output_csv_sha256": hashlib.sha256(csv_bytes).hexdigest(),
+    }
+    if umi_role == "right":
+        manifest["umi_role"] = umi_role
+    return csv_bytes, manifest
+
+
+def _seal_topology(seal: dict) -> str:
+    sources = seal.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        raise ValueError("session seal sources are invalid")
+    keys = set(sources)
+    if keys == set(SOURCE_PATHS):
+        return TOPOLOGY_LEGACY
+    if keys in (set(PAIR_SOURCE_PATHS), set(PAIR_RIGHT_SOURCE_PATHS)):
+        return TOPOLOGY_PAIR
+    raise ValueError("session seal sources are invalid")
+
+
 def _ensure_session_seal(session: Path) -> dict:
     seal_path = session / SEAL_NAME
     existing = assert_safe_path(seal_path, session, SEAL_NAME, kind="file")
@@ -187,6 +328,12 @@ def _ensure_session_seal(session: Path) -> dict:
         _verify_sources_against_seal(session, seal)
         return seal
 
+    topology = _detect_topology(session)
+    source_paths = (
+        _pair_source_paths_for_session(session)
+        if topology == TOPOLOGY_PAIR
+        else _source_paths(topology)
+    )
     captured = _capture_sources(session)
     seal = {
         "schema": SEAL_SCHEMA,
@@ -195,7 +342,7 @@ def _ensure_session_seal(session: Path) -> dict:
                 "sha256": captured[relative]["sha256"],
                 "identity": list(captured[relative]["identity"]),
             }
-            for relative in SOURCE_PATHS
+            for relative in source_paths
         },
     }
     seal["content_sha256"] = _seal_content_sha256(seal)
@@ -227,7 +374,11 @@ def _validate_seal_document(seal: dict) -> None:
     if seal.get("schema") != SEAL_SCHEMA:
         raise ValueError("session seal schema is invalid")
     sources = seal.get("sources")
-    if not isinstance(sources, dict) or set(sources) != set(SOURCE_PATHS):
+    if not isinstance(sources, dict) or set(sources) not in (
+        set(SOURCE_PATHS),
+        set(PAIR_SOURCE_PATHS),
+        set(PAIR_RIGHT_SOURCE_PATHS),
+    ):
         raise ValueError("session seal sources are invalid")
     for relative, evidence in sources.items():
         if not isinstance(evidence, dict) or set(evidence) != {"sha256", "identity"}:
@@ -255,9 +406,22 @@ def _seal_content_sha256(seal: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _capture_sources(session: Path) -> dict[str, dict]:
+def _capture_sources(session: Path, source_paths=None) -> dict[str, dict]:
+    if source_paths is None:
+        seal_path = session / SEAL_NAME
+        if seal_path.is_file():
+            source_paths = tuple(
+                _load_json_object(seal_path.read_bytes(), SEAL_NAME)["sources"]
+            )
+        else:
+            topology = _detect_topology(session)
+            source_paths = (
+                _pair_source_paths_for_session(session)
+                if topology == TOPOLOGY_PAIR
+                else _source_paths(topology)
+            )
     captured = {}
-    for relative in SOURCE_PATHS:
+    for relative in source_paths:
         path = session / relative
         assert_safe_path(path, session, relative, kind="file")
         with path.open("rb") as stream:
@@ -279,9 +443,15 @@ def _capture_sources(session: Path) -> dict[str, dict]:
     return captured
 
 
-def _verify_captured_sources(session: Path, expected: dict[str, dict]) -> None:
-    observed = _capture_sources(session)
-    for relative in SOURCE_PATHS:
+def _verify_captured_sources(
+    session: Path, expected: dict[str, dict], source_paths=None
+) -> None:
+    observed = (
+        _capture_sources(session)
+        if source_paths is None
+        else _capture_sources(session, source_paths)
+    )
+    for relative in expected:
         if (
             observed[relative]["sha256"] != expected[relative]["sha256"]
             or observed[relative]["identity"] != expected[relative]["identity"]
@@ -292,7 +462,7 @@ def _verify_captured_sources(session: Path, expected: dict[str, dict]) -> None:
 def _verify_sources_against_seal(session: Path, seal: dict) -> dict[str, dict]:
     _validate_seal_document(seal)
     observed = _capture_sources(session)
-    for relative in SOURCE_PATHS:
+    for relative in seal["sources"]:
         evidence = seal["sources"][relative]
         if (
             observed[relative]["sha256"] != evidence["sha256"]
@@ -367,6 +537,58 @@ def _reject_active_writer_claims(session: Path) -> None:
 def _offline_session_lease(session: Path):
     with offline_claim(session) as root:
         yield root
+
+
+def _pair_source_paths_for_session(session: Path) -> tuple[str, ...]:
+    present = [
+        role
+        for role in ("left", "right")
+        if (session / role / f"{role}.ir_left.jsonl").is_file()
+    ]
+    if present == ["left"]:
+        return PAIR_SOURCE_PATHS
+    if present == ["right"]:
+        return PAIR_RIGHT_SOURCE_PATHS
+    raise ValueError("single-UMI session must contain exactly one left or right stream")
+
+
+def _pair_role_from_sources(source_bytes: dict[str, bytes]) -> str:
+    keys = set(source_bytes)
+    if keys == set(PAIR_SOURCE_PATHS):
+        return "left"
+    if keys == set(PAIR_RIGHT_SOURCE_PATHS):
+        return "right"
+    raise ValueError("pair source set does not identify exactly one UMI role")
+
+
+def _validate_pair_worker_acceptances(coordinator: dict, umi_role: str = "left") -> None:
+    if coordinator.get("schema") != COORDINATOR_SCHEMA:
+        raise ValueError(
+            f"coordinator.json schema must be {COORDINATOR_SCHEMA}"
+        )
+    worker_acceptance = coordinator.get("worker_acceptance")
+    if not isinstance(worker_acceptance, dict):
+        raise ValueError("coordinator.json worker_acceptance is missing")
+    ego = worker_acceptance.get("ego")
+    if (
+        not isinstance(ego, dict)
+        or ego.get("schema") != "ego.d435i.acceptance.v1"
+        or ego.get("status") != "PASS"
+    ):
+        raise ValueError("coordinator.json ego acceptance is not a d435i PASS")
+    umi = worker_acceptance.get(umi_role)
+    camera_clock = (
+        umi.get("camera_clock") if isinstance(umi, dict) else None
+    )
+    if (
+        not isinstance(umi, dict)
+        or umi.get("result") != "PASS"
+        or not isinstance(camera_clock, dict)
+        or camera_clock.get("verified") is not True
+    ):
+        raise ValueError(
+            f"coordinator.json {umi_role} UMI camera clock is not verified"
+        )
 
 
 def _parse_coordinator(payload: bytes) -> int:
@@ -485,6 +707,82 @@ def _parse_ego_rows(payload: bytes, task_start_ns: int) -> list[FrameStamp]:
     return frames
 
 
+def _parse_d435i_ego_rows(payload: bytes, task_start_ns: int) -> list[FrameStamp]:
+    return _parse_append_only_rows(
+        payload, "ego/ego.ir_left.jsonl", D435I_EGO_STREAM_ID, "ego", task_start_ns
+    )
+
+
+def _parse_pair_umi_rows(
+    payload: bytes, device_id: str, task_start_ns: int
+) -> list[FrameStamp]:
+    return _parse_append_only_rows(
+        payload,
+        f"{device_id}/{device_id}.ir_left.jsonl",
+        f"{device_id}.ir_left",
+        device_id,
+        task_start_ns,
+    )
+
+
+def _parse_append_only_rows(
+    payload: bytes, source: str, stream_id: str, device_id: str, task_start_ns: int
+) -> list[FrameStamp]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{source} is not UTF-8") from exc
+    frames = []
+    seen_sequences = set()
+    previous_timestamp = None
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{source} line {line_number} is malformed JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{source} line {line_number} must be an object")
+        if row.get("stream_id") != stream_id:
+            raise ValueError(
+                f"{source} line {line_number} stream_id must be {stream_id}"
+            )
+        sequence = _nonnegative_integer(
+            row.get("sequence"), f"{device_id} line {line_number} sequence"
+        )
+        acquisition_ns = _nonnegative_integer(
+            row.get("acquisition_ns"),
+            f"{device_id} line {line_number} acquisition_ns",
+        )
+        warmup = _boolean(row.get("warmup"), f"{device_id} line {line_number} warmup")
+        valid = _boolean(row.get("valid"), f"{device_id} line {line_number} valid")
+        clock_domain = row.get("clock_domain")
+        if clock_domain != D435I_CLOCK_DOMAIN:
+            raise ValueError(
+                f"{device_id} line {line_number} clock_domain is unsupported"
+            )
+        offset = _nonnegative_integer(
+            row.get("offset"), f"{device_id} line {line_number} offset"
+        )
+        size = _nonnegative_integer(row.get("size"), f"{device_id} line {line_number} size")
+        if previous_timestamp is not None and acquisition_ns < previous_timestamp:
+            raise ValueError(f"{device_id} timestamp regression")
+        previous_timestamp = acquisition_ns
+        candidate = not warmup and valid and acquisition_ns >= task_start_ns
+        if candidate and sequence in seen_sequences:
+            raise ValueError(f"duplicate ({device_id}, {sequence}) sequence")
+        if candidate:
+            seen_sequences.add(sequence)
+            frames.append(
+                FrameStamp(
+                    device_id,
+                    sequence,
+                    acquisition_ns,
+                    f"{source.removesuffix('.jsonl')}.bin:{offset}:{size}",
+                )
+            )
+    return frames
+
+
 def _parse_d405_rows(
     payload: bytes, device_id: str, task_start_ns: int
 ) -> list[FrameStamp]:
@@ -591,6 +889,51 @@ def _common_overlap(
     if start_ns > end_ns:
         return {"start_ns": None, "end_ns": None}
     return {"start_ns": start_ns, "end_ns": end_ns}
+
+
+def _pair_overlap(
+    ego: list[FrameStamp], left: list[FrameStamp]
+) -> dict[str, int | None]:
+    streams = (ego, left)
+    if any(not stream for stream in streams):
+        return {"start_ns": None, "end_ns": None}
+    start_ns = max(stream[0].acquisition_ns for stream in streams)
+    end_ns = min(stream[-1].acquisition_ns for stream in streams)
+    if start_ns > end_ns:
+        return {"start_ns": None, "end_ns": None}
+    return {"start_ns": start_ns, "end_ns": end_ns}
+
+
+def _serialize_pair_csv(pairs: list, umi_role: str = "left") -> bytes:
+    stream = io.StringIO(newline="")
+    header = PAIR_CSV_HEADER if umi_role == "left" else PAIR_ROLE_CSV_HEADER
+    writer = csv.DictWriter(stream, fieldnames=header, lineterminator="\n")
+    writer.writeheader()
+    for row in pairs:
+        values = {
+                "sample_ns": row.sample_ns,
+                "ego_sequence": row.ego.sequence,
+                "ego_acquisition_ns": row.ego.acquisition_ns,
+                "ego_ref": row.ego.payload_ref,
+                "span_ns": row.span_ns,
+                "trainable": int(row.trainable),
+                "reason": row.reason,
+        }
+        if umi_role == "left":
+            values.update(
+                left_sequence=row.left.sequence,
+                left_acquisition_ns=row.left.acquisition_ns,
+                left_ref=row.left.payload_ref,
+            )
+        else:
+            values.update(
+                umi_role=umi_role,
+                umi_sequence=row.left.sequence,
+                umi_acquisition_ns=row.left.acquisition_ns,
+                umi_ref=row.left.payload_ref,
+            )
+        writer.writerow(values)
+    return stream.getvalue().encode("utf-8")
 
 
 def _serialize_csv(triplets: list[Triplet]) -> bytes:

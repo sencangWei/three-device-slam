@@ -1,0 +1,20 @@
+diff --git a/src/Settings.cc b/src/Settings.cc
+index 82ec5f8..f5b5348 100644
+--- a/src/Settings.cc
++++ b/src/Settings.cc
+@@ -559,8 +559,13 @@ namespace ORB_SLAM3 {
+                 output << "Kannala-Brandt";
+             }
+             output << "" << ": [";
+-            for(size_t i = 0; i < settings.originalCalib2_->size(); i++){
+-                output << " " << settings.originalCalib2_->getParameter(i);
++            // Rectified stereo uses the shared Camera1 model and therefore does
++            // not allocate originalCalib2_. Print that shared model instead.
++            GeometricCamera* originalCalib2 =
++                settings.cameraType_ == Settings::Rectified
++                    ? settings.originalCalib1_ : settings.originalCalib2_;
++            for(size_t i = 0; i < originalCalib2->size(); i++){
++                output << " " << originalCalib2->getParameter(i);
+             }
+             output << " ]" << endl;
+ 

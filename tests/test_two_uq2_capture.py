@@ -110,6 +110,14 @@ def test_vendor_packet_is_big_endian_and_scaled():
     assert packet.raw == packet_bytes(0x010203)
 
 
+def test_vendor_packet_keeps_backup_group_diagnostic_only():
+    packet = TwoUQ2Packet.parse(packet_bytes(0x010203))
+
+    assert packet.main_raw == packet.raw[3:15]
+    assert packet.backup_raw == packet.raw[15:27]
+    assert not hasattr(packet, "temporal_samples")
+
+
 @pytest.mark.parametrize("size", [0, 26, 28])
 def test_packet_length_is_exactly_27(size):
     with pytest.raises(ValueError, match="27"):

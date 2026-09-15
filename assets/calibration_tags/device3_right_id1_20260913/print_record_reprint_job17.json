@@ -1,0 +1,16 @@
+{
+  "schema": "ego.calibration_tag_print_record.v1",
+  "printer": "Brother_DCP_B7530DN_series_USB",
+  "job_id": "Brother_DCP_B7530DN_series_USB-17",
+  "completed_local": "2026-09-13T17:33:11+08:00",
+  "status": "COMPLETED_PRINTER_IDLE",
+  "source_pdf": "/home/robot/three-device-slam/assets/calibration_tags/device3_right_id1_20260913/umi_device3_right_tag36h11_id1_40mm_a4.pdf",
+  "source_pdf_sha256": "79eb0a1619744008a1b7814333af5cde8aee52cf8159478d75247b8ae3c58788",
+  "options": {
+    "media": "A4",
+    "print-scaling": "none",
+    "Duplex": "None",
+    "print-quality": 5
+  },
+  "physical_instruction": "Keep a large continuous white field around the 40mm black square; do not trim near the tag."
+}
